@@ -2,7 +2,7 @@
 
 namespace echo {
 
-hk::Result RunServer(hk_thread* thread, TestMemory& memory, uint64_t tls, uint64_t scratch) {
+hk::Result RunServer(hk_thread* thread, FlatMemory& memory, uint64_t tls, uint64_t scratch) {
     using namespace hk::result;
     const uint64_t name = scratch, handle_list = scratch + 0x10;
     memory.WriteString(name, "echo");
@@ -12,8 +12,21 @@ hk::Result RunServer(hk_thread* thread, TestMemory& memory, uint64_t tls, uint64
 
     std::vector<uint32_t> handles{port}; // waited on
     std::vector<uint32_t> held;          // kept but not served
+    const uint64_t receive_buffer = tls + ReceiveOffset, reply_static = tls + ReceiveOffset + ReceiveSize;
+    // The receive list rides in every message the server leaves in its buffer,
+    // after the data, where replies never reach.
+    auto with_receive_list = [&](Message& message) {
+        message.receive_list = {{receive_buffer, ReceiveSize}};
+        message.receive_list_word = 0x38;
+    };
     uint32_t reply_target = 0;
     for (;;) {
+        if (!reply_target) {
+            Message idle;
+            idle.type = 0;
+            with_receive_list(idle);
+            WriteMessage(memory, tls, idle);
+        }
         memory.WriteWords(handle_list, handles);
         uint32_t index;
         const auto r = svc::ReplyAndReceive(thread, handle_list, static_cast<uint32_t>(handles.size()), reply_target,
@@ -62,6 +75,27 @@ hk::Result RunServer(hk_thread* thread, TestMemory& memory, uint64_t tls, uint64
         case Stats:
             reply.data = {static_cast<uint32_t>(handles.size() + held.size())};
             break;
+        case Buffers: {
+            if (request.statics.size() != 1 || request.sends.size() != 1 || request.receives.size() != 1 ||
+                request.exchanges.size() != 1) {
+                reply.data = {0xffffffff};
+                break;
+            }
+            const auto x = memory.Snapshot(request.statics[0].address, request.statics[0].size);
+            const auto a = memory.Snapshot(request.sends[0].address, request.sends[0].size);
+            auto w = memory.Snapshot(request.exchanges[0].address, request.exchanges[0].size);
+            std::vector<std::byte> b(a.rbegin(), a.rend());
+            b.resize(request.receives[0].size);
+            for (auto& byte : w)
+                byte = static_cast<std::byte>(static_cast<uint8_t>(byte) + 1);
+            memory.Write(request.receives[0].address, b);
+            memory.Write(request.exchanges[0].address, w);
+            std::vector<std::byte> x_reversed(x.rbegin(), x.rend());
+            memory.Write(reply_static, x_reversed);
+            reply.data = {static_cast<uint32_t>(x.size())};
+            reply.statics = {{reply_static, x.size(), 0}};
+            break;
+        }
         case Quit: {
             WriteMessage(memory, tls, reply);
             // Reply with nothing to wait on: the kernel replies, then times out.
@@ -77,6 +111,7 @@ hk::Result RunServer(hk_thread* thread, TestMemory& memory, uint64_t tls, uint64
             reply.data = {0xffffffff};
             break;
         }
+        with_receive_list(reply);
         WriteMessage(memory, tls, reply);
         reply_target = handles[index];
     }

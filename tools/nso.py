@@ -1,8 +1,9 @@
-"""Turn an NSO into a relocated AArch64 ELF for disassemblers.
+"""Turn an NSO into an AArch64 ELF, relocated for disassemblers and the lifter.
 
 Decompresses the three segments, applies the module's relative relocations
 (RELA and RELR) at the chosen base, and writes one PT_LOAD per segment with
-its real permissions plus the .bss.
+its real permissions plus the .bss. With --no-relocate the relocations are
+left for the module's own startup code, which is what module_host loads.
 """
 import argparse
 import hashlib
@@ -144,12 +145,15 @@ def main():
     parser.add_argument("nso")
     parser.add_argument("output")
     parser.add_argument("--base", type=lambda v: int(v, 0), default=0x7100000000)
+    parser.add_argument("--no-relocate", action="store_true",
+                        help="leave relocations unapplied, as the Horizon loader does; for module_host, "
+                             "whose guest crt0 relocates itself")
     args = parser.parse_args()
     segments, bss, build_id = load_nso(Path(args.nso).read_bytes())
     image = bytearray(max(off + len(body) for off, body in segments))
     for off, body in segments:
         image[off:off + len(body)] = body
-    applied = relocate(image, args.base)
+    applied = 0 if args.no_relocate else relocate(image, args.base)
     segments = [(off, bytes(image[off:off + len(body)])) for off, body in segments]
     write_elf(args.output, segments, bss, args.base)
     print(f"build id {build_id.hex()}")

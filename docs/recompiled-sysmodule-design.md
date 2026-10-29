@@ -1,15 +1,18 @@
 # Recompiled system modules: design draft
 
-Status: in progress, 2026-10-29. The analysis tools in `tools/` and milestone 1
-(the kernel and cross-process link, `src/kernel/`) exist. The
+Status: in progress, 2026-10-29. The analysis tools in `tools/`, milestone 1
+(the kernel and cross-process link, `src/kernel/`) and milestone 2 (the
+lifter, `tools/lift.py`, `module_host` and native services) are done: the
+recompiled `pctl` starts in both maintenance and normal boot, registers its
+four ports and answers requests. The
 first host title is MK8D through the mk8-recomp runtime; this repository holds the
 sysmodule work itself.
 
 ## Goal
 
 Replace a hand-written service implementation with the console's own system
-module (sysmodule), statically recompiled by the existing AArch64-to-C++
-pipeline and run beside the title. The first target is the parental-control
+module (sysmodule), statically recompiled to C++ (`tools/lift.py`) and run
+beside the title. The first target is the parental-control
 service MK8D already opens (`pctl`, with `pctl:s`, `pctl:a` and `pctl:r`).
 
 Success means: behind an opt-in switch, MK8D's actual `pctl` requests are
@@ -165,6 +168,116 @@ It keeps the verified bridge's rules: buffers and handle transport stop the
 process, and a child exit or protocol error is fatal to the title rather than
 answered with a guess.
 
+### 6. Lifter and module host
+
+`tools/lift.py` turns the relocated ELF from `tools/nso.py` into C++ against
+`include/rt/ops.h`. It decodes AArch64 itself (capstone is used only to print
+test failures), because the lifter must know each encoding's exact semantics
+rather than an alias's operands.
+
+- **State.** Registers, flags (as four bytes), the 32 vector registers and the
+  system registers the module reads live in `rt::Cpu`. Guest memory is one host
+  reservation of the 39-bit guest space; an access is `base + (address & mask)`
+  and a `memcpy`, so a wild address faults inside the reservation.
+- **Control flow.** Each discovered entry point becomes a host function.
+  Entries are the module entry, every `BL` target, code addresses built by
+  `ADR`/`ADRP`+`ADD`, and code addresses stored in data. `BL`/`BLR` are host
+  calls that set x30 first; `RET` returns; a branch to another entry is a tail
+  call; branches inside a function are `goto`s. A body may include code below
+  its entry (reached by branches), so a function whose first block is not its
+  entry begins with a `goto` to it.
+- **Indirect branches.** `BR` through a recognised jump table (`ADR` base,
+  `LDRB`/`LDRH` offset, `ADD ... LSL #2`, bounded by the nearest `CMP` and
+  `B.HI`/`B.HS`, following register copies) becomes a `switch` over its
+  targets. Every other `BR` is a tail call through the sorted address table;
+  in `pctl` those are all calls through function pointers (192 sites). All
+  jump tables in `pctl` are recognised.
+- **Traps.** An instruction the decoder does not know becomes
+  `rt::Unimplemented`, and falling off a decoded body stops the same way, so a
+  partial lift builds and stops loudly. `pctl` lifts to 4,260 functions with
+  no unknown instructions; the only traps are its `UDF` padding.
+- **Floating point.** Host arithmetic, with NaN results following the AArch64
+  rules (signalling NaN first, then the first quiet NaN in operand order, else
+  the positive default NaN), which differ from x86's.
+- **Exclusives.** A load-exclusive records the address and value; a
+  store-exclusive is a compare-and-swap against that value.
+
+`module_host` (built only when `SWITCH_RECOMP_LIFTED` names a lift output
+directory) loads the module's segments at their link addresses from an
+**unrelocated** ELF (`nso.py --no-relocate`): the module's own startup applies
+its relocations, and loading a pre-relocated image adds the base twice. It
+starts the main thread with x0 = 0 and x1 = its thread handle, runs guest
+threads on host threads (`ExitThread` unwinds to the thread's root), and
+serves the memory, thread and information SVCs itself; IPC and
+synchronization SVCs go to the kernel. A native `sm` (`src/services/sm.cpp`)
+speaks TIPC on `sm:` and maps `RegisterService`/`GetServiceHandle` onto
+kernel named ports, so a port the module registers is announced across links
+like any other. Like the real `sm`, it holds a `GetServiceHandle` for a name
+that is not registered yet and answers once it is.
+
+The services the module calls are served by `NativeHost`
+(`src/services/native.cpp`): authored CMIF interfaces in one kernel process,
+with sub-interfaces returned as moved sessions or, once the client converts a
+session to a domain (Nintendo's clients do), as domain object ids. The stubs
+(`src/services/stubs.cpp`) answer only commands the module has been seen to
+call, and report anything else:
+
+| Service | Commands answered | Answer |
+| :--- | :--- | :--- |
+| `lm` | `OpenLogger`; `ILogger` `Log`, `SetDestination` | accepted and dropped |
+| `pm:bm` | `GetBootMode`, `SetMaintenanceBoot` | boot mode from `RT_BOOT_MODE`, default 1 (maintenance) |
+| `fsp-srv` | `SetCurrentProcess`; system save create, open, read extra data, extend; `IFileSystem` create, delete, open, entry type, commit, space; `IFile` read, write, flush, size | an in-memory save store that starts empty, as on a fresh console |
+| `ovln:snd` | `OpenSender`; `ISender` `Send` | accepted and dropped |
+| `arp:r` | launch and control property queries | "not registered": the caller is not an application |
+| `set:sys` | `GetSettingsItemValue`, `GetSettingsItemValueSize` | a table of items; `pctl!ignore_post_event_interval_from_server` is `false` (an assumption: the retail default is not in the module) |
+| `time:u` | user, network, local and ephemeral system clocks; steady clock; time zone (UTC: location name, calendar and POSIX conversion, its event); shared memory of clock contexts | the host's clock, as on a console whose clocks are set |
+| `psc:m` | `GetPmModule`; `IPmModule` initialize, request, acknowledge, finalize | the power state never changes |
+| `bsd:s` | register client (commands 0 and 33), `StartMonitoring` | every socket operation fails with `ENETDOWN` |
+| `nifm:s` | `CreateGeneralService` | no command answered: queries fail, which pctl treats as offline |
+| `ssl:s` | `SetInterfaceVersion` | contexts refused |
+| `npns:s`, `bgtc:t` | everything (`bgtc:t` opens its interfaces with commands 100 and 101) | events that never fire, otherwise success with zeroed output |
+
+The other client services in the NPDM (`fatal:u`, `acc:e:u1`, `bsdcfg`,
+`dauth:0`, `nsd:u`, `pdm:qry`, `set`, `set:cal`, `sfdnsres`, `srepo:u`) are
+registered as placeholders that answer every command with an error and log
+it; start-up in either boot mode connects to some but needs none of them. A
+module that reaches `fatal:u` has hit a failure, and the call before it is
+the one to look at.
+
+`RT_PROBE=1` adds a client (`src/services/probe.cpp`) that connects to `pctl`,
+calls `CreateService` and then `IsRestrictionEnabled` on the returned
+`IParentalControlService`, prints the replies and ends the host.
+
+Bring-up notes, each confirmed against the module's own code:
+
+- `QueryMemory` must report unmapped memory as `Free` (state 0); the startup
+  code probes past the module's end for free space.
+- `GetInfo` types 28 (alias region extra size) and the pair 37/38 (an extra
+  region's address and size) are queried; 0 means "none".
+- A TIPC reply must have the request's message type (16 + command) and
+  exactly `1 + outputs` data words; the client checks the whole header
+  (including the special header for a moved handle) and aborts otherwise.
+- The kernel writes each thread's own handle at offset 0x110 of its
+  thread-local region: the module's mutex code reads it there to recognise a
+  lock it already holds, and nothing in user code writes it.
+- `DT_INIT` and `DT_FINI` are called by offset from the module base, so the
+  lifter takes them from the module's dynamic section as entry points.
+- Thread stacks come from `MapMemory` (an alias of a `.bss` buffer in the
+  stack region). The source is inaccessible while mapped, so the host copies
+  in on map and back on unmap.
+- The time service's shared memory holds the clock contexts every reader
+  computes the time from. The kernel gives shared memory to a mapping process
+  as a copy of its contents at that moment (`CreateSharedMemory`,
+  `MapSharedMemory`); the contexts are offsets, so a snapshot stays correct
+  as the guest's tick counter advances. Live sharing between processes is not
+  implemented.
+- Clients clone domain sessions (`CloneCurrentObject` on a domain): the clone
+  is a new session with the same object table.
+- `Break` from an abort passes a pointer to a result code; the host prints it.
+- `RT_TRACE=1` logs every SVC. A lift with `--track-pc` stores the guest PC
+  before each instruction, and the fault handler then prints it with registers
+  and a frame-pointer backtrace.
+
 ### Kernel decisions so far
 
 - **Language.** C++20 for the kernel, with a plain C entry (`include/hk/svc.h`)
@@ -174,10 +287,32 @@ answered with a guess.
   `InvalidHandle` 114, `InvalidPointer` 115, `TimedOut` 117, `OutOfRange` 119,
   `NotFound` 121, `SessionClosed` 123, `InvalidState` 125, `OutOfSessions` 7,
   `MessageTooLarge` 260. These choices are this kernel's own:
-  `NotImplemented` (33) for buffer descriptors, light sessions, waitables other
-  than ports and server sessions, and unknown SVCs; `InvalidState` for
-  registering a name twice; a reply that cannot be delivered ends the client's
-  call with `SessionClosed`.
+  `NotImplemented` (33) for light sessions, receive lists in the message
+  buffer itself (mode 1), A/B/W buffers in a reply, and unknown SVCs;
+  `InvalidState` for registering a name twice; a reply that cannot be
+  delivered ends the client's call with `SessionClosed`. Synchronization adds
+  `InvalidAddress` 102, `InvalidCurrentMemory` 106 and `Cancelled` 118;
+  buffers add `OutOfMemory` 104 and `ReceiveListBroken` 258.
+- **Buffers are copied, not shared.** An X buffer's bytes go into the
+  receiver's receive list (one packed buffer, or one per X index), read from
+  the receiver's message buffer when the message arrives. A, B and W buffers
+  are copied into a region the receiving process maps for the request
+  (`GuestMemory::MapIpcBuffer`); when the server replies, B and W are copied
+  back to the client's addresses and the region is unmapped. Across a link
+  the bytes travel in the frames, and the reply carries B and W back. B is
+  copied in as well, so bytes the server does not write come back unchanged.
+  One message carries at most 64 MiB of buffers. A request abandoned without
+  a reply (the session closes first) leaves its mapping until the server
+  process ends.
+- **Threads and synchronization.** The kernel owns thread objects (ids,
+  handles, exit signalling) and events, and implements `WaitSynchronization`,
+  `CancelSynchronization` and the address arbiter: `ArbitrateLock`/`Unlock`
+  hand a guest mutex directly to the next waiter (the word holds the owner's
+  handle, plus `0x40000000` while others wait), and the condition-variable
+  SVCs release the mutex on wait and re-queue a signalled thread for it.
+  Waiters are served first come, first served; priorities are not modelled.
+  The runtime runs the threads; `GuestMemory::CompareExchange32` gives the
+  kernel atomic access to guest words.
 - **Locking.** One kernel mutex and one condition variable. Simple and correct
   for a handful of sessions; revisit if a hot service makes it a bottleneck.
 
@@ -197,6 +332,22 @@ answered with a guess.
   memory, the same boundary recompiled code uses, so milestone 1 needs no
   AArch64 lifter. It exercises the kernel subset, the message copy and handle
   translation without any game or firmware input.
+- **Lifter differential test.** `tools/difftest.py` lifts every distinct
+  straight-line or conditional-branch instruction word in a module on its own,
+  runs each from random register, flag, vector and memory states both as C++
+  and in unicorn, and compares registers, flags, branch outcome and every
+  changed byte. States are biased so loads and stores land in mapped scratch.
+  For `pctl`: 47,456 distinct words, 347,493 cases, all exercised, no
+  differences. Planting a carry-flag bug makes it fail, as it should.
+- **Kernel synchronization tests.** `tests/sync_test.cpp` drives two guest
+  threads through events, thread-exit signalling, cancellation, mutex hand-off
+  and condition variables (8 cases; 100 of 100 repeated runs pass).
+- **Buffer tests.** The echo server's `Buffers` command takes X, A, B and W
+  buffers and answers through B, W and an X of its own; `ipc_test` checks the
+  bytes in one host and that a too-large X fails with `ReceiveListBroken`,
+  and `transport_test` checks the same exchange across the link.
+- **Native service tests.** `tests/native_test.cpp` covers sub-interfaces as
+  moved sessions, domains (convert, object ids, close) and `sm` deferral.
 - **No default change.** All existing suites and GPU checks must pass with the
   switches unset, and the title executable's default path is unchanged.
 
@@ -284,9 +435,10 @@ change".
    and every stub is listed in the results. Networking (`bsd:s`, `nifm:s`,
    `ssl:s`, `npns:s`) is expected to be the largest group and should be
    answered as "no network" rather than implemented.
-3. **Code discovery for sysmodules.** The pipeline's function discovery is
-   tuned on title modules. Sysmodule coverage gaps are handled as for titles:
-   explicit halting sites, never silent fallthrough.
+3. **Code discovery for sysmodules. Answered for `pctl`.** The lifter's own
+   discovery (see Lifter and module host) covers the module: every jump table
+   is recognised and the remaining indirect branches are function-pointer
+   tail calls. Gaps halt explicitly, never fall through silently.
 4. **Cost.** A cross-process round trip per request is acceptable for `pctl`,
    which MK8D calls a handful of times. It would not be acceptable for a hot
    service; measuring it on the first target tells us whether `fs` needs the
@@ -320,6 +472,35 @@ change".
 2. The recompiled `pctl` host completes its own startup in a child process and
    registers its ports, first on the maintenance-mode path (`pm:bm` and
    filesystem only), then on the normal path.
+   - **Done: lifter and module host.** The whole module lifts and builds (MSVC,
+     about 40 s); every instruction form it uses passes the differential test.
+     `module_host` runs it through the C runtime's startup (memory queries,
+     `GetInfo`, heap and TLS set-up, thread queries, guest mutexes) to its
+     first service calls: it connects to `sm:`, registers as a client, and
+     asks for `lm`.
+   - **Done: maintenance-mode start-up and serving.** With buffers in the
+     kernel and the stubs above, `pctl` reads boot mode 1, registers `pctl`
+     (6 sessions), `pctl:s` (8), `pctl:a` (1) and `pctl:r` (1), creates and
+     writes its system save `8000000000000100`, sends overlay notifications,
+     starts its worker thread and waits in its server loop. `RT_PROBE=1`
+     gets a moved `IParentalControlService` from `CreateService`; its
+     `IsRestrictionEnabled` answers `0x10A8E` (pctl, description 133),
+     presumably because the probe has no application registration or
+     capabilities. On that path pctl asks `arp:r` for commands 3 and 6; 6 is
+     not stubbed yet.
+   - **Done: normal start-up and serving.** With `RT_BOOT_MODE=0` pctl also
+     sets up sockets (registration only), the network manager, the clocks
+     and time zone, SSL, push notifications, power state and background
+     tasks, reads one system setting, cleans and rewrites its save, then
+     serves; the same probe passes. Left running for 90 seconds it polls
+     `nifm` about once every ten seconds and does nothing else.
+   - **Milestone 2 is complete.** Known gaps, none of which start-up needs:
+     `arp:r` command 6; the placeholder services; shared memory is a
+     snapshot; guest memory permissions are not enforced; a request abandoned
+     without a reply keeps its buffer mapping until the server exits.
+   - **Next (milestone 3):** run `module_host` as a child process linked to
+     MK8D, with the title's `sm` and a forwarding bridge, and shadow-compare
+     its replies with the verified `pctl`.
 3. Shadow comparison clean across MK8D startup and one race.
 4. Substitution reaches the same reviewed frames as the default path.
 5. Measure round-trip cost, then decide between `aoc:u` (events) and `fs`

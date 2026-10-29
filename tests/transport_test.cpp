@@ -140,7 +140,7 @@ struct World {
     }
 
     hk::Kernel kernel;
-    TestMemory client_memory{ClientBase, 0x1000};
+    FlatMemory client_memory{ClientBase, 0x1000};
     std::shared_ptr<hk::Process> client;
     hk_thread* client_thread{};
     HANDLE host{};
@@ -207,14 +207,52 @@ void CopiedHandleCrossesAndStays() {
     CHECK(svc::CloseHandle(world.client_thread, client_end) == Success);
 }
 
-void BufferDescriptorsStayOnThisSide() {
+
+// Client-side layout for the Buffers command, in the client's scratch area.
+struct BufferCase {
+    static constexpr uint64_t X = 0x400, A = 0x500, B = 0x600, W = 0x700, C = 0x800, Size = 16;
+
+    static std::vector<std::byte> Pattern(uint8_t first) {
+        std::vector<std::byte> bytes(Size);
+        for (size_t i = 0; i < Size; ++i)
+            bytes[i] = static_cast<std::byte>(first + i);
+        return bytes;
+    }
+    static std::vector<std::byte> Reversed(std::vector<std::byte> bytes) { return {bytes.rbegin(), bytes.rend()}; }
+
+    // Fills the client's buffers and builds the request.
+    static Message Prepare(FlatMemory& memory, uint64_t base, uint64_t x_size = Size) {
+        memory.Write(base + X, Pattern(0x40));
+        memory.Write(base + A, Pattern(0x00));
+        memory.Write(base + B, std::vector<std::byte>(Size, std::byte{0xee}));
+        memory.Write(base + W, Pattern(0x10));
+        Message request;
+        request.data = {echo::Buffers};
+        request.statics = {{base + X, x_size, 0}};
+        request.sends = {{base + A, Size}};
+        request.receives = {{base + B, Size}};
+        request.exchanges = {{base + W, Size}};
+        request.receive_list = {{base + C, 0x100}};
+        return request;
+    }
+
+    // Checks what the server wrote back into the client's memory.
+    static bool Verify(FlatMemory& memory, uint64_t base, const Message& reply) {
+        std::vector<std::byte> w = Pattern(0x11);
+        return reply.data == std::vector<uint32_t>{uint32_t{Size}} && reply.statics.size() == 1 &&
+               reply.statics[0].address == base + C && reply.statics[0].size == Size &&
+               memory.Snapshot(base + C, Size) == Reversed(Pattern(0x40)) &&
+               memory.Snapshot(base + B, Size) == Reversed(Pattern(0x00)) && memory.Snapshot(base + W, Size) == w &&
+               memory.Snapshot(base + A, Size) == Pattern(0x00);
+    }
+};
+
+void BuffersCrossTheLink() {
     World world;
-    const uint32_t before = world.ServerHandles();
-    Message request, reply;
-    request.extra_header0 = 1u << 16;
-    request.data = {echo::Echo};
-    CHECK(world.Call(world.session, request, reply) == NotImplemented);
-    CHECK(world.ServerHandles() == before);
+    Message reply;
+    CHECK(world.Call(world.session, BufferCase::Prepare(world.client_memory, World::ClientScratch), reply) == Success);
+    CHECK(BufferCase::Verify(world.client_memory, World::ClientScratch, reply));
+    CHECK(world.Echoes(world.session, {3}));
 }
 
 void ClientCloseReachesTheServer() {
@@ -284,7 +322,7 @@ int main() {
         {"SubInterfaceMovesAcrossTheLink", SubInterfaceMovesAcrossTheLink},
         {"ServerSessionMovesAcrossTheLink", ServerSessionMovesAcrossTheLink},
         {"CopiedHandleCrossesAndStays", CopiedHandleCrossesAndStays},
-        {"BufferDescriptorsStayOnThisSide", BufferDescriptorsStayOnThisSide},
+        {"BuffersCrossTheLink", BuffersCrossTheLink},
         {"ClientCloseReachesTheServer", ClientCloseReachesTheServer},
         {"ServerQuitClosesSessions", ServerQuitClosesSessions},
         {"HostCrashClosesSessions", HostCrashClosesSessions},

@@ -39,12 +39,31 @@ struct Descriptor {
     uint32_t kind{}, id{};
 };
 
+// A buffer a message carries, with the sender's bytes. ordinal counts X
+// buffers for Static, and A, B and W together for the others. A Writeback
+// travels in a reply across a link: the server's final contents of the B or
+// W buffer with that ordinal.
+enum BufferKind : uint32_t { BufferStatic, BufferSend, BufferReceive, BufferExchange, BufferWriteback };
+struct Buffer {
+    uint32_t kind{}, ordinal{};
+    uint64_t address{}, size{};
+    std::vector<std::byte> data;
+};
+
+// An A, B or W buffer mapped into a server for the request it is serving.
+struct Mapping {
+    uint32_t kind{}, ordinal{};
+    uint64_t address{}, size{}; // in the server
+    uint64_t client_address{};  // in a local client
+};
+
 // A message in transit between kernels. Handle slots in words are
 // placeholders; descriptors list the copied then moved handles in order.
 struct Wire {
     uint64_t pid{};
     std::vector<uint32_t> words;
     std::vector<Descriptor> descriptors;
+    std::vector<Buffer> buffers;
 };
 
 // A request waiting for a server. A local client's request lives on its
@@ -57,6 +76,7 @@ struct Request {
     Wire wire;
     Result result{};
     bool done{};
+    std::vector<Mapping> mappings; // in the server, while it serves this request
 };
 
 struct SessionState {
@@ -89,6 +109,28 @@ struct ServerPort final : Object {
     std::string name;
     uint32_t max_sessions{}, sessions{};
     std::deque<std::shared_ptr<ServerSession>> backlog; // connected, not yet accepted
+};
+
+// A thread's handle-visible side: signalled once the thread has exited.
+struct ThreadObject final : Object {
+    hk_thread* thread{}; // null once exited
+    uint64_t id{};
+};
+
+struct EventState {
+    bool signaled{};
+};
+
+struct ReadableEvent final : Object {
+    std::shared_ptr<EventState> state;
+};
+
+struct WritableEvent final : Object {
+    std::shared_ptr<EventState> state;
+};
+
+struct SharedMemory final : Object {
+    std::vector<std::byte> contents;
 };
 
 // A thread blocked on a reply from across a link.
@@ -178,6 +220,20 @@ struct hk_thread {
     hk::Kernel::Impl* kernel{};
     std::shared_ptr<hk::Process> process;
     uint64_t tls{};
+    std::shared_ptr<hk::detail::ThreadObject> object;
+    void* user{};
+    bool cancel_pending{};
+
+    // Address arbiter state, guarded by the kernel lock. A thread waits
+    // either for a guest mutex (lock_owner set) or on a condition variable
+    // key; woken and wake_result report how the wait ended.
+    enum class Wait { None, Mutex, CondVar } wait{};
+    uint64_t mutex_address{};
+    uint64_t cv_key{};
+    uint32_t tag{};
+    hk_thread* lock_owner{};
+    bool woken{};
+    hk::Result wake_result{};
 };
 
 namespace hk {
@@ -198,7 +254,8 @@ enum class Frame : uint32_t {
     Close,              // id: the peer closed its client end
     ServerClosed,       // id: the peer closed the server end
 };
-constexpr uint32_t MaxFrameBytes = 0x10000;
+constexpr uint32_t MaxBufferBytes = 64u << 20; // per message, all buffers together
+constexpr uint32_t MaxFrameBytes = MaxBufferBytes + 0x10000;
 constexpr uint32_t MaxNameBytes = 64;
 
 class FrameWriter {
@@ -221,6 +278,12 @@ public:
         U32(static_cast<uint32_t>(wire.descriptors.size()));
         for (const auto& descriptor : wire.descriptors)
             U32(descriptor.kind).U32(descriptor.id);
+        U32(static_cast<uint32_t>(wire.buffers.size()));
+        for (const auto& buffer : wire.buffers) {
+            U32(buffer.kind).U32(buffer.ordinal).U64(buffer.address).U64(buffer.size);
+            U32(static_cast<uint32_t>(buffer.data.size()));
+            Put(buffer.data.data(), buffer.data.size());
+        }
         return *this;
     }
     std::vector<std::byte> Finish() {
@@ -282,6 +345,26 @@ public:
             descriptor.id = U32();
             wire.descriptors.push_back(descriptor);
         }
+        const uint32_t buffers = U32();
+        if (buffers > 64) {
+            ok_ = false;
+            return wire;
+        }
+        for (uint32_t i = 0; i < buffers && ok_; ++i) {
+            Buffer buffer;
+            buffer.kind = U32();
+            buffer.ordinal = U32();
+            buffer.address = U64();
+            buffer.size = U64();
+            const uint32_t bytes = U32();
+            if (bytes > MaxBufferBytes || bytes_.size() - at_ < bytes) {
+                ok_ = false;
+                return wire;
+            }
+            buffer.data.resize(bytes);
+            Get(buffer.data.data(), bytes);
+            wire.buffers.push_back(std::move(buffer));
+        }
         return wire;
     }
     // True when every read succeeded and the whole body was consumed.
@@ -321,9 +404,45 @@ struct Envelope {
     hipc::Layout layout;
     std::vector<std::shared_ptr<Object>> objects; // copied then moved
     std::vector<uint32_t> source_handles;
+    std::vector<Buffer> buffers; // X in order, then A, B and W in order
     Process* source{};
     uint64_t pid{};
 };
+
+// Reads the buffers a parsed message describes from the sender's memory.
+Result CollectBuffers(Process& from, Envelope& envelope) {
+    const auto& layout = envelope.layout;
+    uint64_t total = 0;
+    auto read = [&](Buffer& buffer) {
+        total += buffer.size;
+        if (total > MaxBufferBytes)
+            return result::MessageTooLarge;
+        buffer.data.resize(buffer.size);
+        if (buffer.size && !from.memory.Read(buffer.address, buffer.data))
+            return result::InvalidPointer;
+        return result::Success;
+    };
+    for (uint32_t i = 0; i < layout.static_count; ++i) {
+        const auto d = hipc::DecodeStatic(&envelope.words[layout.static_word + 2 * i]);
+        Buffer buffer{BufferStatic, i, d.address, d.size, {}};
+        if (const Result r = read(buffer))
+            return r;
+        envelope.buffers.push_back(std::move(buffer));
+    }
+    for (uint32_t i = 0; i < layout.buffer_count(); ++i) {
+        const auto d = hipc::DecodeBuffer(&envelope.words[layout.buffer_word + 3 * i]);
+        const uint32_t kind = i < layout.send_count ? BufferSend
+                              : i < layout.send_count + layout.receive_count ? BufferReceive
+                                                                             : BufferExchange;
+        // B is read too: the server sees the client's memory, and bytes it
+        // does not write must come back unchanged.
+        Buffer buffer{kind, i, d.address, d.address ? d.size : 0, {}};
+        if (const Result r = read(buffer))
+            return r;
+        envelope.buffers.push_back(std::move(buffer));
+    }
+    return result::Success;
+}
 
 // Reads and validates a message in a process's buffer. Changes nothing.
 Result Collect(Process& from, uint64_t tls, Envelope& envelope) {
@@ -344,6 +463,8 @@ Result Collect(Process& from, uint64_t tls, Envelope& envelope) {
         envelope.objects.push_back(std::move(object));
         envelope.source_handles.push_back(handle);
     }
+    if (const Result r = CollectBuffers(from, envelope))
+        return r;
     envelope.source = &from;
     envelope.pid = from.id;
     return result::Success;
@@ -362,12 +483,115 @@ void Release(const std::shared_ptr<Object>& object) {
         object->LastHandleClosed();
 }
 
-// Places the message and its handles in a process's buffer. On failure the
-// receiver is unchanged and moved handles return to the sender (or, for
-// imported objects, are released).
-Result Deliver(Envelope& envelope, Process& to, uint64_t tls) {
+// Undoes CommitMoves for a message that will not be delivered: moved
+// handles return to the sender; imported objects are released.
+void ReturnHandles(Envelope& envelope) {
+    const auto& layout = envelope.layout;
+    for (uint32_t i = 0; i < layout.copy_count + layout.move_count; ++i) {
+        if (!envelope.source)
+            Release(envelope.objects[i]);
+        else if (i >= layout.copy_count)
+            envelope.source->AttachAt(envelope.source_handles[i], envelope.objects[i]);
+    }
+}
+
+void Unmap(Process& process, std::vector<Mapping>& mappings) {
+    for (const auto& mapping : mappings)
+        process.memory.UnmapIpcBuffer(mapping.address, mapping.size);
+    mappings.clear();
+}
+
+// Copies X buffers into the receive list the receiver left in its message
+// buffer, and maps A, B and W buffers (requests only: mappings is null for a
+// reply, which may not carry them). Rewrites the descriptors with the
+// receiver's addresses.
+Result PlaceBuffers(Envelope& envelope, Process& to, uint64_t tls, std::vector<Mapping>* mappings) {
     auto& words = envelope.words;
     const auto& layout = envelope.layout;
+    if (layout.static_count) {
+        std::array<uint32_t, hipc::MessageWords> current{};
+        hipc::Layout receiver;
+        if (!to.memory.Read(tls, std::as_writable_bytes(std::span(current))))
+            return result::InvalidPointer;
+        if (hipc::Parse(current, receiver) != result::Success || receiver.receive_list_count == 0)
+            return result::ReceiveListBroken;
+        uint64_t packed = 0; // used bytes of a single receive buffer
+        for (uint32_t i = 0; i < layout.static_count; ++i) {
+            const Buffer& buffer = envelope.buffers[i];
+            auto d = hipc::DecodeStatic(&words[layout.static_word + 2 * i]);
+            uint64_t address = 0;
+            if (receiver.receive_list_single) {
+                const auto entry = hipc::DecodeReceive(&current[receiver.receive_list_word]);
+                packed = (packed + 15) & ~uint64_t{15};
+                if (packed + buffer.size > entry.size)
+                    return result::ReceiveListBroken;
+                address = entry.address + packed;
+                packed += buffer.size;
+            } else {
+                if (d.index >= receiver.receive_list_count)
+                    return result::ReceiveListBroken;
+                const auto entry = hipc::DecodeReceive(&current[receiver.receive_list_word + 2 * d.index]);
+                if (buffer.size > entry.size)
+                    return result::ReceiveListBroken;
+                address = entry.address;
+            }
+            if (buffer.size && !to.memory.Write(address, buffer.data))
+                return result::ReceiveListBroken;
+            d.address = buffer.size ? address : 0;
+            hipc::EncodeStatic(d, &words[layout.static_word + 2 * i]);
+        }
+    }
+    if (layout.buffer_count() && !mappings)
+        return result::NotImplemented; // A, B and W in a reply
+    for (uint32_t i = 0; i < layout.buffer_count(); ++i) {
+        const Buffer& buffer = envelope.buffers[layout.static_count + i];
+        auto d = hipc::DecodeBuffer(&words[layout.buffer_word + 3 * i]);
+        if (buffer.size == 0) {
+            d.address = 0;
+        } else {
+            uint64_t address;
+            if (!to.memory.MapIpcBuffer(buffer.size, address)) {
+                Unmap(to, *mappings);
+                return result::OutOfMemory;
+            }
+            mappings->push_back({buffer.kind, buffer.ordinal, address, buffer.size, buffer.address});
+            if (!to.memory.Write(address, buffer.data)) {
+                Unmap(to, *mappings);
+                return result::OutOfMemory;
+            }
+            d.address = address;
+        }
+        hipc::EncodeBuffer(d, &words[layout.buffer_word + 3 * i]);
+    }
+    return result::Success;
+}
+
+// The server's final B and W contents, for copying back to the client.
+std::vector<Buffer> TakeWritebacks(Process& server, std::vector<Mapping>& mappings) {
+    std::vector<Buffer> out;
+    for (const auto& mapping : mappings) {
+        if (mapping.kind != BufferReceive && mapping.kind != BufferExchange)
+            continue;
+        Buffer buffer{BufferWriteback, mapping.ordinal, mapping.client_address, mapping.size, {}};
+        buffer.data.resize(mapping.size);
+        if (server.memory.Read(mapping.address, buffer.data))
+            out.push_back(std::move(buffer));
+    }
+    Unmap(server, mappings);
+    return out;
+}
+
+// Places the message and its handles in a process's buffer. On failure
+// moved handles return to the sender (or, for imported objects, are
+// released) and no buffer stays mapped; X bytes already copied into the
+// receiver's receive list may remain.
+Result Deliver(Envelope& envelope, Process& to, uint64_t tls, std::vector<Mapping>* mappings = nullptr) {
+    auto& words = envelope.words;
+    const auto& layout = envelope.layout;
+    if (const Result r = PlaceBuffers(envelope, to, tls, mappings)) {
+        ReturnHandles(envelope);
+        return r;
+    }
     if (layout.send_pid) {
         words[layout.pid_word] = static_cast<uint32_t>(envelope.pid);
         words[layout.pid_word + 1] = static_cast<uint32_t>(envelope.pid >> 32);
@@ -380,6 +604,8 @@ Result Deliver(Envelope& envelope, Process& to, uint64_t tls) {
     }
     if (to.memory.Write(tls, std::as_bytes(std::span(words).first(layout.total_words))))
         return result::Success;
+    if (mappings)
+        Unmap(to, *mappings);
 
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t handle = words[layout.copy_word + i];
@@ -391,12 +617,13 @@ Result Deliver(Envelope& envelope, Process& to, uint64_t tls) {
     return result::InvalidPointer;
 }
 
-Result CopyMessage(Process& from, uint64_t from_tls, Process& to, uint64_t to_tls) {
+Result CopyMessage(Process& from, uint64_t from_tls, Process& to, uint64_t to_tls,
+                   std::vector<Mapping>* mappings = nullptr) {
     Envelope envelope;
     if (const Result r = Collect(from, from_tls, envelope))
         return r;
     CommitMoves(envelope);
-    return Deliver(envelope, to, to_tls);
+    return Deliver(envelope, to, to_tls, mappings);
 }
 
 } // namespace
@@ -460,6 +687,7 @@ struct Kernel::Impl {
         Wire wire;
         wire.pid = envelope.pid;
         wire.words.assign(envelope.words.begin(), envelope.words.begin() + envelope.layout.total_words);
+        wire.buffers = envelope.buffers;
         for (size_t i = 0; i < envelope.objects.size(); ++i) {
             const bool move = i >= envelope.layout.copy_count;
             const uint32_t id = link.AllocateId();
@@ -507,6 +735,14 @@ struct Kernel::Impl {
         if (layout.total_words != wire.words.size() ||
             wire.descriptors.size() != layout.copy_count + layout.move_count)
             return result::InvalidHandle;
+        for (const auto& buffer : wire.buffers)
+            if (buffer.kind != BufferWriteback)
+                envelope.buffers.push_back(buffer);
+        if (envelope.buffers.size() != layout.static_count + layout.buffer_count())
+            return result::InvalidPointer;
+        for (const auto& buffer : envelope.buffers)
+            if (buffer.data.size() != buffer.size)
+                return result::InvalidPointer;
         for (const auto& descriptor : wire.descriptors) {
             auto object = Import(link, descriptor);
             if (!object) {
@@ -858,6 +1094,15 @@ struct Kernel::Impl {
         }
         if (waiter.result)
             return waiter.result;
+        for (const auto& writeback : waiter.wire.buffers) {
+            if (writeback.kind != BufferWriteback)
+                continue;
+            const auto it = std::find_if(envelope.buffers.begin(), envelope.buffers.end(), [&](const Buffer& b) {
+                return (b.kind == BufferReceive || b.kind == BufferExchange) && b.ordinal == writeback.ordinal;
+            });
+            if (it != envelope.buffers.end() && it->size == writeback.data.size())
+                t.process->memory.Write(it->address, writeback.data);
+        }
         Envelope reply;
         if (const Result e = FromWire(link, waiter.wire, reply))
             return e;
@@ -894,6 +1139,7 @@ struct Kernel::Impl {
             return result::InvalidState;
         server->state->current = nullptr;
 
+        std::vector<Buffer> writebacks = TakeWritebacks(*t.process, request->mappings);
         if (Link* link = request->link) {
             Envelope envelope;
             Result r = Collect(*t.process, t.tls, envelope);
@@ -904,11 +1150,15 @@ struct Kernel::Impl {
                 return r;
             }
             CommitMoves(envelope);
-            const Wire wire = Export(*link, envelope);
+            Wire wire = Export(*link, envelope);
+            for (auto& writeback : writebacks)
+                wire.buffers.push_back(std::move(writeback));
             ReplyToRemote(request, result::Success, wire);
             return result::Success;
         }
 
+        for (const auto& writeback : writebacks)
+            request->process->memory.Write(writeback.address, writeback.data);
         const Result copied = CopyMessage(*t.process, t.tls, *request->process, request->tls);
         // A reply that cannot be delivered ends the client's call as a closed session.
         request->result = copied ? result::SessionClosed : result::Success;
@@ -927,13 +1177,13 @@ struct Kernel::Impl {
                 Envelope envelope;
                 r = FromWire(*request->link, request->wire, envelope);
                 if (r == result::Success)
-                    r = Deliver(envelope, *t.process, t.tls);
+                    r = Deliver(envelope, *t.process, t.tls, &request->mappings);
                 if (r != result::Success) {
                     ReplyToRemote(request, r);
                     continue;
                 }
             } else {
-                r = CopyMessage(*request->process, request->tls, *t.process, t.tls);
+                r = CopyMessage(*request->process, request->tls, *t.process, t.tls, &request->mappings);
                 if (r != result::Success) {
                     request->result = r;
                     request->done = true;
@@ -962,10 +1212,17 @@ struct Kernel::Impl {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::nanoseconds(std::max<int64_t>(timeout, 0));
         for (;;) {
+            if (t.cancel_pending) {
+                t.cancel_pending = false;
+                return result::Cancelled;
+            }
             for (uint32_t i = 0; i < count; ++i) {
                 auto object = t.process->Find(handles[i]);
                 r.x[1] = i;
-                if (auto* port = dynamic_cast<ServerPort*>(object.get())) {
+                if (dynamic_cast<ReadableEvent*>(object.get()) || dynamic_cast<ThreadObject*>(object.get())) {
+                    if (IsSignaled(object.get()))
+                        return result::Success;
+                } else if (auto* port = dynamic_cast<ServerPort*>(object.get())) {
                     if (!port->backlog.empty())
                         return result::Success;
                 } else if (auto* server = dynamic_cast<ServerSession*>(object.get())) {
@@ -977,7 +1234,7 @@ struct Kernel::Impl {
                     if (!state.client_open)
                         return result::SessionClosed;
                 } else {
-                    return result::InvalidHandle; // other waitables are not implemented
+                    return result::InvalidHandle;
                 }
             }
             if (timeout >= 0 && std::chrono::steady_clock::now() >= deadline)
@@ -987,6 +1244,334 @@ struct Kernel::Impl {
             else
                 changed.wait_until(lock, deadline);
         }
+    }
+
+    // ---- Synchronization ----
+
+    static constexpr uint32_t kHasWaiters = 0x40000000;
+
+    hk_thread* ThreadFromHandle(hk_thread& t, uint32_t handle) {
+        if (handle == HK_CURRENT_THREAD)
+            return &t;
+        auto object = t.process->Get<ThreadObject>(handle);
+        return object ? object->thread : nullptr;
+    }
+
+    // Whether WaitSynchronization would return for this object now.
+    static bool IsSignaled(Object* object) {
+        if (auto* event = dynamic_cast<ReadableEvent*>(object))
+            return event->state->signaled;
+        if (auto* thread = dynamic_cast<ThreadObject*>(object))
+            return thread->thread == nullptr;
+        if (auto* port = dynamic_cast<ServerPort*>(object))
+            return !port->backlog.empty();
+        if (auto* server = dynamic_cast<ServerSession*>(object)) {
+            const auto& state = *server->state;
+            return !state.client_open || (!state.current && !state.pending.empty());
+        }
+        return false;
+    }
+
+    static bool IsWaitable(Object* object) {
+        return dynamic_cast<ReadableEvent*>(object) || dynamic_cast<ThreadObject*>(object) ||
+               dynamic_cast<ServerPort*>(object) || dynamic_cast<ServerSession*>(object);
+    }
+
+    Result WaitSynchronization(Lock& lock, hk_thread& t, hk_regs& r) {
+        const uint32_t count = static_cast<uint32_t>(r.x[2]);
+        if (count > 0x40)
+            return result::OutOfRange;
+        std::vector<uint32_t> handles(count);
+        if (count && !t.process->memory.Read(r.x[1], std::as_writable_bytes(std::span(handles))))
+            return result::InvalidPointer;
+        std::vector<std::shared_ptr<Object>> objects;
+        for (uint32_t handle : handles) {
+            std::shared_ptr<Object> object =
+                handle == HK_CURRENT_THREAD ? std::shared_ptr<Object>(t.object) : t.process->Find(handle);
+            if (!object || !IsWaitable(object.get()))
+                return result::InvalidHandle;
+            objects.push_back(std::move(object));
+        }
+        const auto timeout = static_cast<int64_t>(r.x[3]);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::nanoseconds(std::max<int64_t>(timeout, 0));
+        for (;;) {
+            if (t.cancel_pending) {
+                t.cancel_pending = false;
+                return result::Cancelled;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                if (IsSignaled(objects[i].get())) {
+                    r.x[1] = i;
+                    return result::Success;
+                }
+            }
+            if (timeout >= 0 && std::chrono::steady_clock::now() >= deadline)
+                return result::TimedOut;
+            if (timeout < 0)
+                changed.wait(lock);
+            else
+                changed.wait_until(lock, deadline);
+        }
+    }
+
+    Result CancelSynchronization(hk_thread& t, hk_regs& r) {
+        hk_thread* target = ThreadFromHandle(t, static_cast<uint32_t>(r.x[0]));
+        if (!target)
+            return result::InvalidHandle;
+        target->cancel_pending = true;
+        changed.notify_all();
+        return result::Success;
+    }
+
+    Result CreateSharedMemory(hk_thread& t, hk_regs& r) {
+        const uint64_t size = r.x[1];
+        if (size == 0 || size % 0x1000 || size > (64u << 20))
+            return result::OutOfRange;
+        auto memory = std::make_shared<SharedMemory>();
+        memory->contents.resize(size);
+        r.x[1] = t.process->Add(std::move(memory));
+        return result::Success;
+    }
+
+    // MapSharedMemory(handle, address, size, permission): a copy of the
+    // contents at this moment.
+    Result MapSharedMemory(hk_thread& t, hk_regs& r) {
+        auto memory = t.process->Get<SharedMemory>(static_cast<uint32_t>(r.x[0]));
+        if (!memory)
+            return result::InvalidHandle;
+        const uint64_t address = r.x[1], size = r.x[2];
+        if (address % 0x1000 || size != memory->contents.size())
+            return result::InvalidAddress;
+        if (!t.process->memory.MapAt(address, size))
+            return result::InvalidCurrentMemory;
+        t.process->memory.Write(address, memory->contents);
+        return result::Success;
+    }
+
+    Result UnmapSharedMemory(hk_thread& t, hk_regs& r) {
+        auto memory = t.process->Get<SharedMemory>(static_cast<uint32_t>(r.x[0]));
+        if (!memory)
+            return result::InvalidHandle;
+        t.process->memory.UnmapAt(r.x[1], r.x[2]);
+        return result::Success;
+    }
+
+    Result CreateEvent(hk_thread& t, hk_regs& r) {
+        auto state = std::make_shared<EventState>();
+        auto writable = std::make_shared<WritableEvent>();
+        auto readable = std::make_shared<ReadableEvent>();
+        writable->state = readable->state = state;
+        r.x[1] = t.process->Add(std::move(writable));
+        r.x[2] = t.process->Add(std::move(readable));
+        return result::Success;
+    }
+
+    Result SignalEvent(hk_thread& t, hk_regs& r) {
+        auto event = t.process->Get<WritableEvent>(static_cast<uint32_t>(r.x[0]));
+        if (!event)
+            return result::InvalidHandle;
+        event->state->signaled = true;
+        changed.notify_all();
+        return result::Success;
+    }
+
+    Result ClearEvent(hk_thread& t, hk_regs& r) {
+        auto object = t.process->Find(static_cast<uint32_t>(r.x[0]));
+        if (auto* writable = dynamic_cast<WritableEvent*>(object.get()))
+            writable->state->signaled = false;
+        else if (auto* readable = dynamic_cast<ReadableEvent*>(object.get()))
+            readable->state->signaled = false;
+        else
+            return result::InvalidHandle;
+        return result::Success;
+    }
+
+    Result ResetSignal(hk_thread& t, hk_regs& r) {
+        auto event = t.process->Get<ReadableEvent>(static_cast<uint32_t>(r.x[0]));
+        if (!event)
+            return result::InvalidHandle;
+        if (!event->state->signaled)
+            return result::InvalidState;
+        event->state->signaled = false;
+        return result::Success;
+    }
+
+    Result GetThreadId(hk_thread& t, hk_regs& r) {
+        const uint32_t handle = static_cast<uint32_t>(r.x[1]);
+        std::shared_ptr<ThreadObject> object =
+            handle == HK_CURRENT_THREAD ? t.object : t.process->Get<ThreadObject>(handle);
+        if (!object)
+            return result::InvalidHandle;
+        r.x[1] = object->id;
+        return result::Success;
+    }
+
+    static bool Load32(GuestMemory& memory, uint64_t address, uint32_t& value) {
+        return memory.Read(address, std::as_writable_bytes(std::span(&value, 1)));
+    }
+
+    static bool Store32(GuestMemory& memory, uint64_t address, uint32_t value) {
+        uint32_t expected = 0;
+        if (!Load32(memory, address, expected))
+            return false;
+        for (;;) {
+            const uint32_t seen = expected;
+            if (!memory.CompareExchange32(address, expected, value))
+                return false;
+            if (expected == seen)
+                return true;
+        }
+    }
+
+    void Wake(hk_thread& t, Result result) {
+        t.woken = true;
+        t.wake_result = result;
+        t.wait = hk_thread::Wait::None;
+        t.lock_owner = nullptr;
+        changed.notify_all();
+    }
+
+    // Releases the guest mutex at address held by owner: hands it to the
+    // first thread waiting for it (marking the word if others still wait) or
+    // clears it.
+    Result ReleaseLock(hk_thread& owner, uint64_t address) {
+        hk_thread* next = nullptr;
+        bool more = false;
+        for (hk_thread* w : lock_waiters) {
+            if (w->lock_owner != &owner || w->mutex_address != address)
+                continue;
+            if (!next)
+                next = w;
+            else
+                more = true;
+        }
+        uint32_t value = 0;
+        if (next) {
+            std::erase(lock_waiters, next);
+            for (hk_thread* w : lock_waiters)
+                if (w->lock_owner == &owner && w->mutex_address == address)
+                    w->lock_owner = next;
+            value = next->tag | (more ? kHasWaiters : 0);
+        }
+        if (!Store32(owner.process->memory, address, value))
+            return result::InvalidCurrentMemory;
+        if (next)
+            Wake(*next, result::Success);
+        return result::Success;
+    }
+
+    Result ArbitrateLock(Lock& lock, hk_thread& t, hk_regs& r) {
+        const uint32_t owner_handle = static_cast<uint32_t>(r.x[0]);
+        const uint64_t address = r.x[1];
+        if (address % 4)
+            return result::InvalidAddress;
+        uint32_t value;
+        if (!Load32(t.process->memory, address, value))
+            return result::InvalidCurrentMemory;
+        if (value != (owner_handle | kHasWaiters))
+            return result::Success; // the owner changed; the guest retries
+        hk_thread* owner = ThreadFromHandle(t, owner_handle);
+        if (!owner)
+            return result::InvalidHandle;
+        t.wait = hk_thread::Wait::Mutex;
+        t.mutex_address = address;
+        t.tag = static_cast<uint32_t>(r.x[2]);
+        t.lock_owner = owner;
+        t.woken = false;
+        lock_waiters.push_back(&t);
+        changed.wait(lock, [&] { return t.woken; });
+        return t.wake_result;
+    }
+
+    Result ArbitrateUnlock(hk_thread& t, hk_regs& r) {
+        const uint64_t address = r.x[0];
+        if (address % 4)
+            return result::InvalidAddress;
+        return ReleaseLock(t, address);
+    }
+
+    Result WaitProcessWideKeyAtomic(Lock& lock, hk_thread& t, hk_regs& r) {
+        const uint64_t address = r.x[0];
+        const uint64_t key = r.x[1];
+        const auto timeout = static_cast<int64_t>(r.x[3]);
+        if (address % 4)
+            return result::InvalidAddress;
+        if (const Result e = ReleaseLock(t, address))
+            return e;
+        t.wait = hk_thread::Wait::CondVar;
+        t.mutex_address = address;
+        t.cv_key = key;
+        t.tag = static_cast<uint32_t>(r.x[2]);
+        t.woken = false;
+        cv_waiters.push_back(&t);
+        if (!Store32(t.process->memory, key, 1)) {
+            std::erase(cv_waiters, &t);
+            t.wait = hk_thread::Wait::None;
+            return result::InvalidCurrentMemory;
+        }
+        if (timeout >= 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout);
+            changed.wait_until(lock, deadline, [&] { return t.woken; });
+        } else {
+            changed.wait(lock, [&] { return t.woken; });
+        }
+        if (!t.woken) {
+            std::erase(cv_waiters, &t);
+            std::erase(lock_waiters, &t);
+            t.wait = hk_thread::Wait::None;
+            t.lock_owner = nullptr;
+            return result::TimedOut;
+        }
+        return t.wake_result;
+    }
+
+    // Wakes up to count condition-variable waiters on key (all if count <= 0).
+    // Each woken thread takes its mutex if it is free, or queues for it.
+    Result SignalProcessWideKey(hk_thread& t, hk_regs& r) {
+        const uint64_t key = r.x[0];
+        const auto count = static_cast<int32_t>(r.x[1]);
+        int32_t woken = 0;
+        for (auto it = cv_waiters.begin(); it != cv_waiters.end() && (count <= 0 || woken < count);) {
+            hk_thread* w = *it;
+            if (w->cv_key != key || w->process != t.process) {
+                ++it;
+                continue;
+            }
+            it = cv_waiters.erase(it);
+            ++woken;
+            AcquireForWaiter(*w);
+        }
+        const bool remaining = std::any_of(cv_waiters.begin(), cv_waiters.end(),
+                                           [&](hk_thread* w) { return w->cv_key == key && w->process == t.process; });
+        if (!remaining)
+            Store32(t.process->memory, key, 0);
+        return result::Success;
+    }
+
+    void AcquireForWaiter(hk_thread& w) {
+        GuestMemory& memory = w.process->memory;
+        uint32_t value = 0;
+        for (;;) {
+            if (!Load32(memory, w.mutex_address, value))
+                return Wake(w, result::InvalidCurrentMemory);
+            uint32_t expected = value;
+            const uint32_t desired = value == 0 ? w.tag : (value | kHasWaiters);
+            if (!memory.CompareExchange32(w.mutex_address, expected, desired))
+                return Wake(w, result::InvalidCurrentMemory);
+            if (expected == value)
+                break;
+        }
+        if (value == 0)
+            return Wake(w, result::Success);
+        hk_thread* owner = nullptr;
+        if (auto object = w.process->Get<ThreadObject>(value & ~kHasWaiters))
+            owner = object->thread;
+        if (!owner)
+            return Wake(w, result::InvalidHandle);
+        w.wait = hk_thread::Wait::Mutex;
+        w.lock_owner = owner;
+        lock_waiters.push_back(&w);
     }
 
     Result ManageNamedPort(hk_thread& t, hk_regs& r) {
@@ -1039,6 +1624,9 @@ struct Kernel::Impl {
     std::condition_variable changed;
     PortRegistry ports;
     std::vector<std::unique_ptr<hk_thread>> threads;
+    uint64_t next_thread_id = 0x50;
+    std::vector<hk_thread*> lock_waiters; // waiting for a guest mutex
+    std::deque<hk_thread*> cv_waiters;    // waiting on a condition variable key
     std::vector<std::unique_ptr<Link>> links;
     std::vector<std::unique_ptr<Request>> remote_requests;
 };
@@ -1061,13 +1649,51 @@ std::shared_ptr<Process> Kernel::CreateProcess(uint64_t process_id, GuestMemory&
 
 hk_thread* Kernel::CreateThread(const std::shared_ptr<Process>& process, uint64_t tls_address) {
     std::lock_guard lock(impl_->mutex);
-    auto thread = std::make_unique<hk_thread>(hk_thread{impl_.get(), process, tls_address});
+    auto thread = std::make_unique<hk_thread>();
+    thread->kernel = impl_.get();
+    thread->process = process;
+    thread->tls = tls_address;
+    thread->object = std::make_shared<ThreadObject>();
+    thread->object->thread = thread.get();
+    thread->object->id = impl_->next_thread_id++;
     return impl_->threads.emplace_back(std::move(thread)).get();
 }
 
 void Kernel::DestroyThread(hk_thread* thread) {
     std::lock_guard lock(impl_->mutex);
+    thread->object->thread = nullptr;
+    std::erase(impl_->lock_waiters, thread);
+    std::erase(impl_->cv_waiters, thread);
+    // Threads queued for a mutex this thread still owned can never get it.
+    for (hk_thread* w : impl_->lock_waiters)
+        if (w->lock_owner == thread)
+            impl_->Wake(*w, result::InvalidHandle);
+    std::erase_if(impl_->lock_waiters, [](hk_thread* w) { return w->woken; });
     std::erase_if(impl_->threads, [&](const auto& owned) { return owned.get() == thread; });
+    impl_->changed.notify_all();
+}
+
+uint32_t Kernel::AddThreadHandle(hk_thread* thread) {
+    std::lock_guard lock(impl_->mutex);
+    return thread->process->Add(thread->object);
+}
+
+hk_thread* Kernel::FindThread(hk_thread* caller, uint32_t handle) {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->ThreadFromHandle(*caller, handle);
+}
+
+uint64_t Kernel::ThreadId(hk_thread* thread) const { return thread->object->id; }
+
+void Kernel::SetThreadUser(hk_thread* thread, void* user) { thread->user = user; }
+
+void* Kernel::ThreadUser(hk_thread* thread) const { return thread->user; }
+
+uint32_t Kernel::CreateSharedMemory(const std::shared_ptr<Process>& process, std::vector<std::byte> contents) {
+    std::lock_guard lock(impl_->mutex);
+    auto memory = std::make_shared<SharedMemory>();
+    memory->contents = std::move(contents);
+    return process->Add(std::move(memory));
 }
 
 void Kernel::DestroyProcess(const std::shared_ptr<Process>& process) {
@@ -1113,6 +1739,20 @@ extern "C" void hk_svc(hk_thread* thread, uint32_t id, hk_regs* regs) {
     case HK_SVC_ACCEPT_SESSION: result = kernel.AcceptSession(*thread, *regs); break;
     case HK_SVC_REPLY_AND_RECEIVE: result = kernel.ReplyAndReceive(lock, *thread, *regs); break;
     case HK_SVC_MANAGE_NAMED_PORT: result = kernel.ManageNamedPort(*thread, *regs); break;
+    case HK_SVC_SIGNAL_EVENT: result = kernel.SignalEvent(*thread, *regs); break;
+    case HK_SVC_CLEAR_EVENT: result = kernel.ClearEvent(*thread, *regs); break;
+    case HK_SVC_RESET_SIGNAL: result = kernel.ResetSignal(*thread, *regs); break;
+    case HK_SVC_WAIT_SYNCHRONIZATION: result = kernel.WaitSynchronization(lock, *thread, *regs); break;
+    case HK_SVC_CANCEL_SYNCHRONIZATION: result = kernel.CancelSynchronization(*thread, *regs); break;
+    case HK_SVC_ARBITRATE_LOCK: result = kernel.ArbitrateLock(lock, *thread, *regs); break;
+    case HK_SVC_ARBITRATE_UNLOCK: result = kernel.ArbitrateUnlock(*thread, *regs); break;
+    case HK_SVC_WAIT_PROCESS_WIDE_KEY_ATOMIC: result = kernel.WaitProcessWideKeyAtomic(lock, *thread, *regs); break;
+    case HK_SVC_SIGNAL_PROCESS_WIDE_KEY: result = kernel.SignalProcessWideKey(*thread, *regs); break;
+    case HK_SVC_GET_THREAD_ID: result = kernel.GetThreadId(*thread, *regs); break;
+    case HK_SVC_CREATE_EVENT: result = kernel.CreateEvent(*thread, *regs); break;
+    case HK_SVC_CREATE_SHARED_MEMORY: result = kernel.CreateSharedMemory(*thread, *regs); break;
+    case HK_SVC_MAP_SHARED_MEMORY: result = kernel.MapSharedMemory(*thread, *regs); break;
+    case HK_SVC_UNMAP_SHARED_MEMORY: result = kernel.UnmapSharedMemory(*thread, *regs); break;
     default: result = hk::result::NotImplemented; break;
     }
     regs->x[0] = result;

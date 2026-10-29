@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     const auto write_handle = static_cast<uintptr_t>(std::strtoull(argv[2], nullptr, 10));
 
     constexpr uint64_t Base = 0x10000000, Pid = 0x51;
-    TestMemory memory(Base, 0x1000);
+    FlatMemory memory(Base, 0x1000, echo::IpcArea);
     hk::Result result;
     {
         hk::Kernel kernel;
