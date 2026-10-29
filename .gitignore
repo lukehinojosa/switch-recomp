@@ -1,0 +1,13 @@
+# Build output
+cmake-build-*/
+.idea/
+
+# Never commit console material or anything generated from it
+*.keys
+*.nca
+*.nsp
+*.xci
+firmware/
+extracted/
+out/
+__pycache__/
