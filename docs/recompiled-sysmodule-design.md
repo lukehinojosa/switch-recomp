@@ -6,7 +6,8 @@ lifter, `tools/lift.py`, `module_host` and native services) are done: the
 recompiled `pctl` starts in both maintenance and normal boot, registers its
 four ports and answers requests. The
 first host title is MK8D through the mk8-recomp runtime; this repository holds the
-sysmodule work itself.
+sysmodule work itself. This work is now phase 0 of the project
+[plan](../plan.md), which carries milestones 4 and 5 into its roadmap.
 
 ## Goal
 
@@ -29,9 +30,9 @@ The repository ships only authored source: the kernel extensions, the bridge
 and the tests. The sysmodule binaries come from firmware the developer has
 already supplied locally, the same way title modules do today. Generated C++,
 objects and executables for system modules stay private and gitignored, under
-the same rules as title modules ([LEGAL.md](../LEGAL.md),
-[distribution audit](distribution-audit.md)). No key handling or firmware
-extraction tooling is added by this design. Firmware is a separate copyrighted
+the same rules as title modules. `tools/nca.py` decrypts and extracts
+firmware and game content with the developer's own keys; the keys, and
+everything it writes, stay local. Firmware is a separate copyrighted
 input, so a legal and provenance review is a precondition for publishing any
 of this source, not a follow-up.
 

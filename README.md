@@ -3,7 +3,9 @@
 Research into statically recompiling Nintendo Switch system modules (the
 userland sysmodules, not the kernel) and running them under a native runtime,
 starting with the parental-control module MK8D talks to. See the
-[design draft](docs/recompiled-sysmodule-design.md).
+[design draft](docs/recompiled-sysmodule-design.md). The [plan](plan.md) sets
+the wider direction: a native host that runs the Switch's recompiled userland
+and any recompiled game, with a roadmap.
 
 This repository holds authored source only. Firmware, keys and anything
 generated from them are supplied and kept locally, and are never committed.
