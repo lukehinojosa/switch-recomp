@@ -168,6 +168,26 @@ It keeps the verified bridge's rules: buffers and handle transport stop the
 process, and a child exit or protocol error is fatal to the title rather than
 answered with a guess.
 
+The title does not run the HIPC layer itself. `module_client`
+(`src/client/module_link.h`) gives it one: a kernel of its own holding one
+client process with one thread, linked to `module_host` started as a child
+process (`module_host --link`). `ModuleLink::Connect` reaches a port the
+module registered through `sm`, which the link announces like any named port;
+`Session::Request` builds a plain CMIF request (no domain: a title domain
+object maps to one child session), sends it and returns the result, the
+output words and any moved sessions as new `Session`s. Requests from
+different title threads are serialized on the one client thread. The child
+runs in a job that kills it when the title exits; a child that exits closes
+its sessions, and later requests fail with a kernel result. The title tells
+the module who it is with `--application`: its PID as the module sees it,
+its program ID, version and `control.nacp`, which `arp:r` reports, as `pm`
+and `ns` register an application at launch on a console.
+
+Output comparison has to allow for one transport difference: the verified
+service returns exactly the output bytes (one byte for a `bool`), while a
+CMIF reply carries whole words. The comparison takes the verified bytes as a
+prefix of the module's output.
+
 ### 6. Lifter and module host
 
 `tools/lift.py` turns the relocated ELF from `tools/nso.py` into C++ against
@@ -228,7 +248,7 @@ call, and report anything else:
 | `pm:bm` | `GetBootMode`, `SetMaintenanceBoot` | boot mode from `RT_BOOT_MODE`, default 1 (maintenance) |
 | `fsp-srv` | `SetCurrentProcess`; system save create, open, read extra data, extend; `IFileSystem` create, delete, open, entry type, commit, space; `IFile` read, write, flush, size | an in-memory save store that starts empty, as on a fresh console |
 | `ovln:snd` | `OpenSender`; `ISender` `Send` | accepted and dropped |
-| `arp:r` | launch and control property queries | "not registered": the caller is not an application |
+| `arp:r` | launch and control property queries (by PID or program ID), command 6 | the process given by `--application` is a running application with that program ID, version and `control.nacp`, on the SD card, instance ID 1; any other caller is "not registered". Command 6 is read as `GetApplicationInstanceId(pid)` (libnx's numbering; pctl sends a PID): an assumption |
 | `set:sys` | `GetSettingsItemValue`, `GetSettingsItemValueSize` | a table of items; `pctl!ignore_post_event_interval_from_server` is `false` (an assumption: the retail default is not in the module) |
 | `time:u` | user, network, local and ephemeral system clocks; steady clock; time zone (UTC: location name, calendar and POSIX conversion, its event); shared memory of clock contexts | the host's clock, as on a console whose clocks are set |
 | `psc:m` | `GetPmModule`; `IPmModule` initialize, request, acknowledge, finalize | the power state never changes |
@@ -484,10 +504,8 @@ change".
      writes its system save `8000000000000100`, sends overlay notifications,
      starts its worker thread and waits in its server loop. `RT_PROBE=1`
      gets a moved `IParentalControlService` from `CreateService`; its
-     `IsRestrictionEnabled` answers `0x10A8E` (pctl, description 133),
-     presumably because the probe has no application registration or
-     capabilities. On that path pctl asks `arp:r` for commands 3 and 6; 6 is
-     not stubbed yet.
+     `IsRestrictionEnabled` (1031) answers success and `false`. (An earlier
+     probe sent command 1403 by mistake and got `0x10A8E`.)
    - **Done: normal start-up and serving.** With `RT_BOOT_MODE=0` pctl also
      sets up sockets (registration only), the network manager, the clocks
      and time zone, SSL, push notifications, power state and background
@@ -501,7 +519,82 @@ change".
    - **Next (milestone 3):** run `module_host` as a child process linked to
      MK8D, with the title's `sm` and a forwarding bridge, and shadow-compare
      its replies with the verified `pctl`.
-3. Shadow comparison clean across MK8D startup and one race.
+3. Shadow comparison clean across MK8D startup and one race. (Closed on
+   start-up and a second title instead of a race; see the end of this item.)
+   - **Done: the client side and a game-free shadow check.** `module_host
+     --link` and `--application`, the `module_client` library and
+     `client_test` (requests, PID, sub-interfaces, a missing port and a child
+     crash, against an authored CMIF host in its own process). Native
+     services now end every reply with the rest of the 16 bytes reserved for
+     header alignment, as the system's own servers do; clients that trimmed
+     it found nothing to trim before.
+   - **Done: shadow check without the game.** `pctl_shadow` starts the
+     recompiled `pctl` with Mario Kart 8 Deluxe (`0100152000022000`, update
+     4.0.1, its own `control.nacp`) registered as the application and makes
+     the calls the verified service implements. On port `pctl` all nine
+     agree in both boot modes: `CreateServiceWithoutInitialize` and
+     `CreateService` return a service; `Initialize` succeeds;
+     `IsRestrictionEnabled` is `false`, `GetStereoVisionRestriction` `false`
+     and `IsStereoVisionPermitted` `true`. On `pctl:s`, `pctl:a` and `pctl:r`
+     the two differ, as known: the verified service gives those ports no
+     capabilities and refuses `Initialize` and `CreateService` with
+     `0x1068E`, while firmware gives them capabilities and the module
+     succeeds. MK8D never calls methods on those ports.
+   - **Done: the title side, and a clean shadow of MK8D start-up.**
+     mk8-recomp's runtime recipe gains `runtime/src/mk8_sysmodule_link.*`,
+     built when configured with `NX_SWITCH_RECOMP_DIR`: it starts
+     `module_host` through `module_client`, and either shadows the verified
+     pctl bridge (`NX_SYSMODULE_SHADOW`: each request also goes to the module,
+     the verified reply is delivered, every comparison is logged, and
+     sub-interfaces are shadowed by the module's own) or forwards to the
+     module (`NX_SYSMODULE_PORTS`). Built against MK8D 4.0.1 (the base
+     program is AArch32; the update's AArch64 program is the one that runs),
+     the runtime's 57 tests pass. In the game's own start-up it opens all four
+     ports and makes five calls (`CreateServiceWithoutInitialize` on each
+     port, then `Initialize` on the `pctl` child): all five agree. With the
+     module answering instead, start-up takes the same path. Both runs, and
+     a run without the module, then stop at the same null access after
+     `content:/` lookups fail: no RomFS was supplied, which this comparison
+     does not need, since pctl comes before the GPU device and any asset.
+   - **Done: the game's local inputs, except shaders.** `nca.py --romfs`
+     applies the update's patch section to the base RomFS: its indirect table
+     (3,648 relocations) maps each range to the base or the patch, and patch
+     data is decrypted with AES-CTR-Ex (1,106 subsections, each with its own
+     counter generation). All 740,490 blocks of the 12.1 GB image match their
+     IVFC hashes. `nca.py --system-data` writes the firmware's font and Mii
+     archives the same way, and mk8-recomp's `font_bundle.py` packs the seven
+     decrypted fonts. With these, MK8D runs 120 seconds at 60 fps with audio
+     and no fault, and the shadow stays clean, but every draw is skipped
+     (`NX_SKIP_MISSING_SHADERS`): no shader is translated yet.
+   - **Shaders, for local testing:** the upstream runtime's Ryujinx-based
+     `spirv_harness` translates the shaders the runtime dumps as it meets
+     them (MK8D's raw compute blocks wrapped in the header it expects, and
+     fragment shaders that write integer targets given unsigned outputs).
+     After a few play-and-translate passes (about 2,500 stages) the title
+     screen renders, and the shadow is still clean. This is not the
+     suyu-based cache mk8-recomp uses, so rendering is not verified.
+   - **Done: a second title, Super Smash Bros. Ultimate (WindowSmash).**
+     WindowSmash had replaced the SDK's two `nn::pctl` checks with native
+     functions; without them, the SDK's own client runs and its requests reach
+     `ipc_sysmodule.c`, which either answers permissively or forwards them
+     through `hk_module_client.dll` (the C interface) to `module_host`. SSBU
+     asks nothing at start-up; entering Online it opens all four ports
+     (`CreateServiceWithoutInitialize` on each), then sends `Initialize` and
+     `CheckFreeCommunicationPermission` (1001). The module answers all six
+     with success, and the game joins the online lobby as it does with the
+     native answers. There is no verified service on this side to shadow
+     against, so this is forwarding only.
+   - **Milestone 3 is complete, without the race.** The verified service
+     serves five commands on the service object (1, 1031, 1062, 1065 and
+     1432) and stops the game on any other, and mk8-recomp's runs reached
+     races with it, so a race could only compare commands from that set.
+     The first four agree, in `pctl_shadow` and (for `Initialize`) in the
+     game's start-up, and SSBU showed the module serving a second title's
+     SDK, including a command MK8D never sends. The fifth, 1432, returns an
+     event as a copied handle, which the link does not carry (the client
+     closes copied handles), so it moves to milestone 5.
 4. Substitution reaches the same reviewed frames as the default path.
 5. Measure round-trip cost, then decide between `aoc:u` (events) and `fs`
-   (buffers) as the next target.
+   (buffers) as the next target. Events include pctl's 1432 left over from
+   milestone 3: carrying copied handles over the link, so that the title
+   receives the module's event and can wait on it.

@@ -1,6 +1,13 @@
 // module_host: runs one lifted sysmodule against the host kernel.
 //
-// Usage: module_host <module.elf> [main-thread-stack-size]
+// Usage: module_host [options] <module.elf> [main-thread-stack-size]
+//
+// Options:
+//   --link <read> <write>   serve over a link to the parent host process, on
+//                           two inherited pipe handles; the ports the module
+//                           registers become reachable from the parent
+//   --application <pid> <program id> <version> <control.nacp>
+//                           the application arp:r reports for that process
 //
 // The ELF is the module as tools/nso.py --no-relocate writes it: the same
 // image the lift came from, but with relocations left for the module's own
@@ -10,6 +17,7 @@
 // serves pctl and exit (see services/probe.h).
 #include "guest_space.h"
 #include "hk/kernel.h"
+#include "hk/link.h"
 #include "rt/ops.h"
 #include "services/probe.h"
 #include "services/sm.h"
@@ -19,10 +27,12 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -421,18 +431,47 @@ void Svc(Cpu& c, u32 id, u64 pc) {
 
 int main(int argc, char** argv) {
     using namespace rt;
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: module_host <module.elf> [main-thread-stack-size]\n");
-        return 2;
+    const auto usage = [] {
+        std::fprintf(stderr, "usage: module_host [--link <read> <write>] "
+                             "[--application <pid> <program id> <version> <control.nacp>] "
+                             "<module.elf> [main-thread-stack-size]\n");
+        std::exit(2);
+    };
+    uintptr_t link_read = 0, link_write = 0;
+    services::StubOptions stub_options;
+    int arg = 1;
+    for (; arg < argc && std::strncmp(argv[arg], "--", 2) == 0; ++arg) {
+        const std::string option = argv[arg];
+        if (option == "--link" && arg + 2 < argc) {
+            link_read = static_cast<uintptr_t>(std::strtoull(argv[arg + 1], nullptr, 10));
+            link_write = static_cast<uintptr_t>(std::strtoull(argv[arg + 2], nullptr, 10));
+            arg += 2;
+        } else if (option == "--application" && arg + 4 < argc) {
+            services::Application application;
+            application.process_id = std::strtoull(argv[arg + 1], nullptr, 0);
+            application.program_id = std::strtoull(argv[arg + 2], nullptr, 16);
+            application.version = static_cast<uint32_t>(std::strtoul(argv[arg + 3], nullptr, 0));
+            std::ifstream control(argv[arg + 4], std::ios::binary);
+            application.control.resize(0x4000);
+            if (!control.read(reinterpret_cast<char*>(application.control.data()), 0x4000))
+                Fail("could not read 0x4000 bytes of application control data");
+            stub_options.application = std::move(application);
+            arg += 4;
+        } else {
+            usage();
+        }
     }
-    uint64_t stack_size = argc > 2 ? std::strtoull(argv[2], nullptr, 0) : 0x10000;
+    if (arg >= argc)
+        usage();
+    const char* module_path = argv[arg];
+    uint64_t stack_size = arg + 1 < argc ? std::strtoull(argv[arg + 1], nullptr, 0) : 0x10000;
     stack_size = AlignUp(stack_size, 0x1000);
 
     Host host;
     g_host = &host;
     char trace[8] = {};
     host.trace = GetEnvironmentVariableA("RT_TRACE", trace, sizeof trace) > 0 && trace[0] != '0';
-    LoadElf(host.space, argv[1]);
+    LoadElf(host.space, module_path);
 
     const uint64_t stack = Layout::kStackBase;
     if (!host.space.Map(stack, stack_size, kStateStack, kPermRW))
@@ -440,7 +479,6 @@ int main(int argc, char** argv) {
     host.process = host.kernel.CreateProcess(0x50, host.space);
     services::ServiceManager sm(host.kernel, host.trace);
     services::NativeHost stubs(host.kernel, host.trace);
-    services::StubOptions stub_options;
     stub_options.trace = host.trace;
     char boot_mode[8] = {};
     if (GetEnvironmentVariableA("RT_BOOT_MODE", boot_mode, sizeof boot_mode) > 0)
@@ -450,6 +488,8 @@ int main(int argc, char** argv) {
     char probe[8] = {};
     if (GetEnvironmentVariableA("RT_PROBE", probe, sizeof probe) > 0 && probe[0] != '0')
         services::StartPctlProbe(host.kernel);
+    if (link_read)
+        host.kernel.AttachLink(hk::OpenPipeStream(link_read, link_write), false);
     AddVectoredExceptionHandler(1, OnFault);
 
     // The kernel starts the main thread at the module entry with x0 = 0 and

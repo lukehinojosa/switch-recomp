@@ -232,8 +232,14 @@ struct NativeHost::State {
             else
                 result = kUnknownCommand;
             if (trace || result == kUnknownCommand) {
-                std::fprintf(stderr, "native: %s%s command %u (%zu bytes in) -> %08x\n", object->Name(),
-                             control ? " control" : "", request.command, request.raw.size(), result);
+                std::string input;
+                for (size_t i = 0; i < request.raw.size() && i < 16; ++i) {
+                    char hex[4];
+                    std::snprintf(hex, sizeof hex, "%02x", static_cast<unsigned>(request.raw[i]));
+                    input += hex;
+                }
+                std::fprintf(stderr, "native: %s%s command %u (%zu bytes in: %s) -> %08x\n", object->Name(),
+                             control ? " control" : "", request.command, request.raw.size(), input.c_str(), result);
             }
         }
         Finish(reply, session, domain, result, std::move(response));
@@ -285,6 +291,9 @@ struct NativeHost::State {
             reply.data.push_back(word);
         }
         reply.data.insert(reply.data.end(), out_objects.begin(), out_objects.end());
+        // Like a request, the data size counts the whole 16 bytes reserved
+        // for aligning the header, whatever part the padding used.
+        reply.data.insert(reply.data.end(), 4 - Padding(reply), 0);
     }
 
     hk::Result HandleControl(const Request& request, Response& response, Session& session) {

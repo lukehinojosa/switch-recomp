@@ -96,22 +96,45 @@ public:
     }
 };
 
-// arp:r: IReader. No process is registered as an application, which is
-// what arp reports for a system process such as a test client.
+// arp:r: IReader. Reports the one application in the options, if any; every
+// other process is unregistered, as a system process such as a test client is.
 class ApplicationReader final : public Interface {
 public:
+    explicit ApplicationReader(std::optional<Application> application) : application_(std::move(application)) {}
     const char* Name() const override { return "arp:r"; }
-    hk::Result Handle(const Request& request, Response&) override {
+    hk::Result Handle(const Request& request, Response& response) override {
         switch (request.command) {
-        case 0: // GetApplicationLaunchProperty(pid)
+        case 0: // GetApplicationLaunchProperty(pid) -> ApplicationLaunchProperty
         case 1: // GetApplicationLaunchPropertyWithApplicationId(application id)
+            if (!Matches(request))
+                return kArpNotRegistered;
+            response.Out(application_->program_id);
+            response.Out(application_->version);
+            response.Out(uint32_t{0x0505}); // base and patch storage: SD card (5); kind: application (0)
+            return 0;
         case 2: // GetApplicationControlProperty(pid) -> B
         case 3: // GetApplicationControlPropertyWithApplicationId(application id) -> B
-            return kArpNotRegistered;
+            if (!Matches(request))
+                return kArpNotRegistered;
+            return request.OutBuffer(application_->control) ? 0 : kUnknown;
+        case 6: // GetApplicationInstanceId(pid) -> instance id (libnx's numbering; pctl sends a PID)
+            if (!application_ || request.In<uint64_t>(0) != application_->process_id)
+                return kArpNotRegistered;
+            response.Out(uint64_t{1}); // the first application launched since boot
+            return 0;
         default:
             return kUnknown;
         }
     }
+
+private:
+    bool Matches(const Request& request) const {
+        if (!application_)
+            return false;
+        const auto key = request.In<uint64_t>(0);
+        return request.command % 2 == 0 ? key == application_->process_id : key == application_->program_id;
+    }
+    std::optional<Application> application_;
 };
 
 // bsd:s: IClient. There is no network: clients register, and every socket
@@ -727,7 +750,7 @@ void AddStubs(NativeHost& host, const StubOptions& options) {
     host.Add("time:u", 32, [] { return std::make_shared<TimeService>(); });
     host.Add("nifm:s", 16, [] { return std::make_shared<NetworkStatic>(); });
     host.Add("bsd:s", 32, [] { return std::make_shared<Sockets>(); });
-    host.Add("arp:r", 16, [] { return std::make_shared<ApplicationReader>(); });
+    host.Add("arp:r", 16, [application = options.application] { return std::make_shared<ApplicationReader>(application); });
     host.Add("ovln:snd", 8, [] { return std::make_shared<OverlaySenderService>(); });
     host.Add("pm:bm", 6, [mode = options.boot_mode] { return std::make_shared<BootMode>(mode); });
 }

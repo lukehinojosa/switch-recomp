@@ -5,11 +5,23 @@
 
 #include "native.h"
 
+#include <optional>
+
 namespace services {
+
+// An application process as arp registers it at launch.
+struct Application {
+    uint64_t process_id = 0;
+    uint64_t program_id = 0;
+    uint32_t version = 0;
+    std::vector<std::byte> control; // its control.nacp
+};
 
 struct StubOptions {
     // pm:bm GetBootMode: 0 normal, 1 maintenance.
     uint32_t boot_mode = 1;
+    // What arp:r reports as running; none means no process is an application.
+    std::optional<Application> application;
     bool trace = false;
 };
 

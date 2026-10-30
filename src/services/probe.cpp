@@ -84,7 +84,7 @@ void Probe(hk::Kernel& kernel) {
     if (created.kernel || created.result || created.move.size() != 1)
         std::exit(6);
 
-    const Reply restricted = Call(thread, *memory, created.move[0], 1403, false, {}); // IsRestrictionEnabled
+    const Reply restricted = Call(thread, *memory, created.move[0], 1031, false, {}); // IsRestrictionEnabled
     std::fprintf(stderr, "probe: IParentalControlService IsRestrictionEnabled -> kernel %08x, result %08x, value %u\n",
                  restricted.kernel, restricted.result, restricted.raw.empty() ? 0xffffffffu : restricted.raw[0] & 0xff);
     // Any result the module itself produced shows it is serving; whether the

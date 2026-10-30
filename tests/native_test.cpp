@@ -93,15 +93,18 @@ struct Client {
         const Message message = ReadMessage(memory, Tls);
         reply.move = message.move;
         const uint32_t word = 2 + (message.move.empty() ? 0 : 1) + static_cast<uint32_t>(message.move.size());
-        size_t at = (4 - word % 4) % 4;
+        const size_t pad = (4 - word % 4) % 4;
+        size_t at = pad;
         if (object)
             at += 4; // domain reply header
-        if (message.data.size() < at + 4 || message.data[at] != OutMagic) {
+        // The data ends with the rest of the 16 bytes reserved for alignment.
+        if (message.data.size() < at + 4 + (4 - pad) || message.data[at] != OutMagic) {
             reply.result = ~0u;
             return reply;
         }
         reply.result = message.data[at + 2];
-        reply.raw.assign(message.data.begin() + static_cast<ptrdiff_t>(at + 4), message.data.end());
+        reply.raw.assign(message.data.begin() + static_cast<ptrdiff_t>(at + 4),
+                         message.data.end() - static_cast<ptrdiff_t>(4 - pad));
         if (out_objects && reply.raw.size() >= out_objects) {
             reply.objects.assign(reply.raw.end() - static_cast<ptrdiff_t>(out_objects), reply.raw.end());
             reply.raw.resize(reply.raw.size() - out_objects);

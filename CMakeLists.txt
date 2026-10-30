@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(switch_recomp LANGUAGES CXX)
+project(switch_recomp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,13 +24,20 @@ target_include_directories(hkernel
     PUBLIC include
     PRIVATE src/kernel)
 
+# Tests are registered only when this is the top-level project, not when a
+# title's runtime adds it as a subdirectory to build module_client.
 enable_testing()
+function(switch_recomp_test name target)
+    if(PROJECT_IS_TOP_LEVEL)
+        add_test(NAME ${name} COMMAND ${target})
+    endif()
+endfunction()
 
 add_executable(ipc_test
     tests/ipc_test.cpp
     tests/echo_server.cpp)
 target_link_libraries(ipc_test PRIVATE hkernel)
-add_test(NAME ipc COMMAND ipc_test)
+switch_recomp_test(ipc ipc_test)
 
 # The echo server in its own host process, driven over a pipe link.
 add_executable(echo_host
@@ -47,18 +54,49 @@ add_library(native_services
 target_include_directories(native_services PUBLIC src)
 target_link_libraries(native_services PUBLIC hkernel)
 
+# The title-side client of a module host: starts it as a linked child process
+# and sends CMIF requests to the ports it registers.
+add_library(module_client src/client/module_link.cpp)
+target_include_directories(module_client PUBLIC src)
+target_link_libraries(module_client PUBLIC hkernel)
+
+# The same as a DLL with a C interface (include/hk/module_client.h), for
+# titles in C or built with another toolchain.
+add_library(hk_module_client SHARED src/client/module_client_c.cpp)
+target_compile_definitions(hk_module_client PRIVATE HK_MODULE_CLIENT_BUILD)
+target_include_directories(hk_module_client PUBLIC include)
+target_link_libraries(hk_module_client PRIVATE module_client)
+if(MINGW)
+    # Carry the C++ runtime inside, so that it does not depend on which
+    # libstdc++ DLL is found first.
+    target_link_options(hk_module_client PRIVATE -static-libgcc -static-libstdc++ -static)
+endif()
+
+add_executable(cmif_host tests/cmif_host.cpp)
+target_link_libraries(cmif_host PRIVATE native_services)
+
+add_executable(client_test tests/client_test.cpp)
+target_link_libraries(client_test PRIVATE module_client)
+add_dependencies(client_test cmif_host)
+switch_recomp_test(client client_test)
+
+add_executable(client_c_test tests/client_c_test.c)
+target_link_libraries(client_c_test PRIVATE hk_module_client)
+add_dependencies(client_c_test cmif_host)
+switch_recomp_test(client_c client_c_test)
+
 add_executable(native_test tests/native_test.cpp)
 target_link_libraries(native_test PRIVATE native_services)
-add_test(NAME native COMMAND native_test)
+switch_recomp_test(native native_test)
 
 add_executable(sync_test tests/sync_test.cpp)
 target_link_libraries(sync_test PRIVATE hkernel)
-add_test(NAME sync COMMAND sync_test)
+switch_recomp_test(sync sync_test)
 
 add_executable(transport_test tests/transport_test.cpp)
 target_link_libraries(transport_test PRIVATE hkernel)
 add_dependencies(transport_test echo_host)
-add_test(NAME transport COMMAND transport_test)
+switch_recomp_test(transport transport_test)
 
 # A module lifted by tools/lift.py, run by module_host. Off unless
 # SWITCH_RECOMP_LIFTED names the lift output directory: the generated code
@@ -78,4 +116,9 @@ if(SWITCH_RECOMP_LIFTED)
         src/runtime/host.cpp
         src/runtime/guest_space.cpp)
     target_link_libraries(module_host PRIVATE native_services lifted_module)
+
+    # Compares the lifted pctl with mk8-recomp's verified service, without
+    # the game (see the file for its arguments).
+    add_executable(pctl_shadow tests/pctl_shadow.cpp)
+    target_link_libraries(pctl_shadow PRIVATE module_client)
 endif()

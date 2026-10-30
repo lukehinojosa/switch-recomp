@@ -78,4 +78,28 @@ the module serves `pctl`, then exits.
 
 `nca.py --extract <folder>` writes the matching modules' ExeFS files (`main`,
 `main.npdm`) for analysis. Keep that folder outside the repository or under an
-ignored path.
+ignored path. `nca.py --keys <prod.keys> --nacp <game.nsp> <out>` writes a
+game's `control.nacp` (its application control data) from the NSP's Control
+NCA, and `--exefs <game.nsp> <folder>` its program's ExeFS, decrypted with the
+title key from the NSP's own ticket. `--romfs <game.xci|nsp> <out> [--update
+<update.nsp>]` writes the game's RomFS image, with the update's patch (BKTR)
+section applied over it when given, and `--firmware <folder> --system-data
+<folder> <id>...` writes system-data archives (fonts, Mii data) as RomFS images.
+Both check every block against the section's IVFC hashes as they write.
+
+`module_host --link <read> <write>` serves over a link to a parent process,
+which reaches the ports the module registers; `--application <pid> <program
+id> <version> <control.nacp>` makes `arp:r` report that process as a running
+application. The `module_client` library (`src/client/`) is the parent's side:
+it starts the host, connects to its ports and sends CMIF requests. With a
+lifted `pctl`, `pctl_shadow` uses it to make the requests Mario Kart 8 Deluxe
+makes and compare the replies with mk8-recomp's verified service:
+
+```
+out/msvc-pctl/Release/pctl_shadow.exe out/msvc-pctl/Release/module_host.exe out/pctl.load.elf <control.nacp> [boot mode]
+```
+
+`hk_module_client.dll` offers the same client through a C interface
+(`include/hk/module_client.h`), for titles written in C or built with another
+toolchain; it shares no C++ runtime with its caller. `client_c_test` drives it
+from C.
