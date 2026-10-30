@@ -114,6 +114,18 @@ struct Message {
     uint32_t receive_list_word = 0; // 0: right after the data
 };
 
+// Words of padding before a CMIF header, which starts at the first 16-byte
+// boundary of the data: the header, special header, PID, handles and buffer
+// descriptors come first.
+inline uint32_t CmifPadding(const Message& m) {
+    const bool special = m.send_pid || !m.copy.empty() || !m.move.empty();
+    const uint32_t data_word = 2 + (special ? 1 : 0) + (m.send_pid ? 2 : 0) +
+                               static_cast<uint32_t>(m.copy.size() + m.move.size()) +
+                               2 * static_cast<uint32_t>(m.statics.size()) +
+                               3 * static_cast<uint32_t>(m.sends.size() + m.receives.size() + m.exchanges.size());
+    return (4 - data_word % 4) % 4;
+}
+
 inline void WriteMessage(FlatMemory& memory, uint64_t tls, const Message& message) {
     const bool special = message.send_pid || !message.copy.empty() || !message.move.empty();
     uint32_t receive_mode = 0;
@@ -298,6 +310,12 @@ inline hk::Result SignalEvent(hk_thread* t, uint32_t handle) {
     hk_regs r{};
     r.x[0] = handle;
     return Call(t, HK_SVC_SIGNAL_EVENT, r);
+}
+
+inline hk::Result ClearEvent(hk_thread* t, uint32_t handle) {
+    hk_regs r{};
+    r.x[0] = handle;
+    return Call(t, HK_SVC_CLEAR_EVENT, r);
 }
 
 inline hk::Result ResetSignal(hk_thread* t, uint32_t handle) {

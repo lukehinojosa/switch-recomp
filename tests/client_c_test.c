@@ -1,14 +1,24 @@
 /* The module client's C interface (include/hk/module_client.h), from C:
  * starts cmif_host, then a request, the PID descriptor, a sub-interface, an
- * unknown command and a missing port. */
+ * unknown command, an event and a missing port. */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L /* readlink, under -std=c11 */
+#endif
 #include "hk/module_client.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define HOST_NAME "cmif_host.exe"
+#else
+#include <unistd.h>
+#define MAX_PATH 4096
+#define HOST_NAME "cmif_host"
+#endif
 
 static int failures = 0;
 
@@ -20,11 +30,24 @@ static int failures = 0;
         }                                                                                \
     } while (0)
 
+static int changes = 0;
+static char history[16];
+
+static void watched(void *user, int signaled) {
+    (void)user;
+    if (changes < (int)sizeof history - 1) history[changes++] = signaled ? '1' : '0';
+}
+
 int main(void) {
     char host[MAX_PATH + 32];
-    DWORD size = GetModuleFileNameA(NULL, host, MAX_PATH);
+#ifdef _WIN32
+    size_t size = GetModuleFileNameA(NULL, host, MAX_PATH);
+#else
+    ssize_t got = readlink("/proc/self/exe", host, MAX_PATH);
+    size_t size = got > 0 ? (size_t)got : 0;
+#endif
     while (size && host[size - 1] != '\\' && host[size - 1] != '/') --size;
-    memcpy(host + size, "cmif_host.exe", sizeof "cmif_host.exe");
+    memcpy(host + size, HOST_NAME, sizeof HOST_NAME);
 
     char error[256] = "";
     hk_module *module = hk_module_start(host, NULL, 0, 0x1234567890ull, error, sizeof error);
@@ -65,6 +88,33 @@ int main(void) {
         hk_module_reply_free(&reply);
 
         CHECK(hk_module_request(session, 7, NULL, 0, 0, &reply) == 0 && reply.result != 0);
+        hk_module_reply_free(&reply);
+
+        /* An event: the host's changes reach the mirror before the reply that
+         * follows them, and the watcher sees each. */
+        CHECK(hk_module_request(session, 4, NULL, 0, 0, &reply) == 0);
+        CHECK(reply.result == 0 && reply.event_count == 1 && reply.copied_handles == 0);
+        if (reply.event_count == 1) {
+            hk_module_event *event = reply.events[0];
+            hk_module_reply step;
+            CHECK(!hk_module_event_signaled(event));
+            CHECK(hk_module_event_wait(event, 1000000) == 0);
+            hk_module_event_watch(event, watched, NULL);
+            CHECK(hk_module_request(session, 5, NULL, 0, 0, &step) == 0 && step.result == 0);
+            hk_module_reply_free(&step);
+            CHECK(hk_module_event_signaled(event));
+            CHECK(hk_module_event_wait(event, -1) == 1);
+            hk_module_event_clear(event);
+            CHECK(!hk_module_event_signaled(event));
+            CHECK(hk_module_request(session, 5, NULL, 0, 0, &step) == 0 && step.result == 0);
+            hk_module_reply_free(&step);
+            CHECK(hk_module_request(session, 6, NULL, 0, 0, &step) == 0 && step.result == 0);
+            hk_module_reply_free(&step);
+            CHECK(!hk_module_event_signaled(event));
+            hk_module_event_watch(event, NULL, NULL);
+            CHECK(changes == 4 && strcmp(history, "1010") == 0);
+            hk_module_event_close(event);
+        }
         hk_module_reply_free(&reply);
         hk_module_close(session);
     }

@@ -1,6 +1,8 @@
-// module_host: runs one lifted sysmodule against the host kernel.
+// module_host: runs a lifted sysmodule, or a lifted title, against the host
+// kernel.
 //
 // Usage: module_host [options] <module.elf> [main-thread-stack-size]
+//        module_host [options] --title <folder>
 //
 // Options:
 //   --link <read> <write>   serve over a link to the parent host process, on
@@ -8,6 +10,12 @@
 //                           registers become reachable from the parent
 //   --application <pid> <program id> <version> <control.nacp>
 //                           the application arp:r reports for that process
+//   --title <folder>        run an application: every module tools/nso.py
+//                           --exefs laid out in the folder (layout.txt and the
+//                           <name>.load.elf files), with the program id, main
+//                           thread and address space from its main.npdm
+//   --romfs <image>         the title's RomFS image (tools/nca.py --romfs),
+//                           served by fsp-srv as its data storage
 //
 // The ELF is the module as tools/nso.py --no-relocate writes it: the same
 // image the lift came from, but with relocations left for the module's own
@@ -19,6 +27,7 @@
 #include "hk/kernel.h"
 #include "hk/link.h"
 #include "rt/ops.h"
+#include "services/application.h"
 #include "services/probe.h"
 #include "services/sm.h"
 #include "services/stubs.h"
@@ -32,6 +41,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,11 +65,23 @@ struct ThreadContext {
     std::thread host_thread;
 };
 
+// What GetInfo and the main thread need to know about the process.
+struct ProcessInfo {
+    uint64_t program_id = 0x010000000000002E; // pctl, the first module run
+    bool application = false;
+    uint64_t main_stack_size = 0x10000;
+    uint64_t total_memory = 0x10000000;
+};
+
 struct Host {
     GuestSpace space;
     hk::Kernel kernel;
     std::shared_ptr<hk::Process> process;
+    ProcessInfo info;
     bool trace = false;
+
+    std::mutex heap_mutex;
+    uint64_t heap_size = 0;
 
     std::mutex threads_mutex;
     std::vector<std::unique_ptr<ThreadContext>> threads;
@@ -172,11 +194,17 @@ void DumpRegisters(const Cpu& c) {
     std::fprintf(stderr, "\n");
 }
 
-void LoadElf(GuestSpace& space, const char* path) {
+std::vector<uint8_t> ReadFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (data.size() < 64 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0)
-        Fail("not an ELF");
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+void LoadElf(GuestSpace& space, const std::string& path) {
+    std::vector<uint8_t> data = ReadFile(path);
+    if (data.size() < 64 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) {
+        std::fprintf(stderr, "module_host: %s is not an ELF\n", path.c_str());
+        std::exit(3);
+    }
     uint64_t phoff;
     uint16_t phnum;
     std::memcpy(&phoff, &data[0x20], 8);
@@ -199,6 +227,48 @@ void LoadElf(GuestSpace& space, const char* path) {
             Fail("could not map a segment");
         std::memcpy(space.base() + vaddr, &data[offset], filesz);
     }
+}
+
+// Loads the modules of a title as tools/nso.py --exefs laid them out, and
+// reads the process's metadata from main.npdm.
+void LoadTitle(GuestSpace& space, const std::string& folder, ProcessInfo& info) {
+    std::ifstream layout(folder + "/layout.txt");
+    if (!layout)
+        Fail("no layout.txt in the title folder");
+    std::string line;
+    uint64_t first = 0;
+    while (std::getline(layout, line)) {
+        std::istringstream fields(line);
+        std::string name;
+        uint64_t base, size;
+        if (line.empty() || line[0] == '#' || !(fields >> name >> std::hex >> base >> size))
+            continue;
+        LoadElf(space, folder + "/" + name + ".load.elf");
+        std::fprintf(stderr, "loaded %-8s at %010" PRIx64 "\n", name.c_str(), base);
+        if (!first)
+            first = base;
+    }
+    // The lift's entry is the first module, rtld, which links the rest.
+    if (first != rt_module_entry)
+        Fail("the title's first module is not where the lift was entered");
+
+    // META: flags at 0x0C (bits 1 to 3 the address space type), main thread
+    // stack size at 0x1C, ACI0's offset at 0x70 and its program id at +0x10.
+    std::vector<uint8_t> npdm = ReadFile(folder + "/main.npdm");
+    if (npdm.size() < 0x80 || std::memcmp(npdm.data(), "META", 4) != 0)
+        Fail("no main.npdm in the title folder");
+    if ((npdm[0x0C] >> 1 & 7) != 3)
+        Fail("only the 39-bit address space is laid out");
+    uint32_t stack_size, aci_offset;
+    std::memcpy(&stack_size, &npdm[0x1C], 4);
+    std::memcpy(&aci_offset, &npdm[0x70], 4);
+    if (aci_offset + 0x18 > npdm.size() || std::memcmp(&npdm[aci_offset], "ACI0", 4) != 0)
+        Fail("main.npdm has no ACI0");
+    std::memcpy(&info.program_id, &npdm[aci_offset + 0x10], 8);
+    info.main_stack_size = stack_size;
+    info.application = true;
+    // The application pool of a 4 GB console.
+    info.total_memory = 0xCD500000;
 }
 
 } // namespace
@@ -268,6 +338,7 @@ void Svc(Cpu& c, u32 id, u64 pc) {
     case HK_SVC_CREATE_SHARED_MEMORY:
     case HK_SVC_MAP_SHARED_MEMORY:
     case HK_SVC_UNMAP_SHARED_MEMORY:
+    case HK_SVC_CREATE_TRANSFER_MEMORY:
         hk_svc(thread->kernel_thread, id, &regs);
         break;
     case 0x06: { // QueryMemory(MemoryInfo* out, PageInfo* out, address)
@@ -282,6 +353,24 @@ void Svc(Cpu& c, u32 id, u64 pc) {
         }
         regs.x[0] = 0;
         regs.x[1] = 0;
+        break;
+    }
+    case 0x01: { // SetHeapSize(size) -> address
+        const uint64_t size = c.x[1];
+        std::lock_guard lock(g_host->heap_mutex);
+        uint64_t& current = g_host->heap_size;
+        bool ok = size % 0x200000 == 0 && size <= Layout::kHeapSize;
+        if (ok && size > current)
+            ok = g_host->space.Map(Layout::kHeapBase + current, size - current, kStateNormal, kPermRW);
+        else if (ok && size < current)
+            ok = g_host->space.Unmap(Layout::kHeapBase + size, current - size);
+        if (!ok) {
+            regs.x[0] = hk::MakeKernelResult(size % 0x200000 ? 102 : 103); // InvalidSize, OutOfMemory
+            break;
+        }
+        current = size;
+        regs.x[0] = 0;
+        regs.x[1] = Layout::kHeapBase;
         break;
     }
     case 0x02: // SetMemoryPermission(address, size, perm)
@@ -394,8 +483,12 @@ void Svc(Cpu& c, u32 id, u64 pc) {
         case 3: value = Layout::kAliasSize; break;
         case 4: value = Layout::kHeapBase; break;
         case 5: value = Layout::kHeapSize; break;
-        case 6: case 21: value = 0x10000000; break;    // total memory
-        case 7: case 22: value = 0x01000000; break;    // used memory
+        case 6: case 21: value = g_host->info.total_memory; break;
+        case 7: case 22: {                             // used memory: the heap and a little
+            std::lock_guard lock(g_host->heap_mutex);
+            value = g_host->heap_size + 0x01000000;
+            break;
+        }
         case 8: value = 0; break;                      // debugger attached
         case 11: value = 0x0123456789ABCDEFull * (c.x[3] + 1); break; // random entropy
         case 12: value = Layout::kAslrBase; break;
@@ -403,9 +496,9 @@ void Svc(Cpu& c, u32 id, u64 pc) {
         case 14: value = Layout::kStackBase; break;
         case 15: value = Layout::kStackSize; break;
         case 16: case 17: value = 0; break;            // system resource size
-        case 18: value = 0x010000000000002E; break;    // program id
+        case 18: value = g_host->info.program_id; break;
         case 20: value = 0; break;                     // user exception context
-        case 23: value = 0; break;                     // is application
+        case 23: value = g_host->info.application; break;
         case 24: value = 0x100; break;                 // free thread count
         case 28: value = 0; break;                     // alias region extra size
         case 37: case 38: value = 0; break;            // an extra region's address and size: none
@@ -434,10 +527,11 @@ int main(int argc, char** argv) {
     const auto usage = [] {
         std::fprintf(stderr, "usage: module_host [--link <read> <write>] "
                              "[--application <pid> <program id> <version> <control.nacp>] "
-                             "<module.elf> [main-thread-stack-size]\n");
+                             "{<module.elf> [main-thread-stack-size] | --title <folder> [--romfs <image>]}\n");
         std::exit(2);
     };
     uintptr_t link_read = 0, link_write = 0;
+    const char* title = nullptr;
     services::StubOptions stub_options;
     int arg = 1;
     for (; arg < argc && std::strncmp(argv[arg], "--", 2) == 0; ++arg) {
@@ -457,21 +551,29 @@ int main(int argc, char** argv) {
                 Fail("could not read 0x4000 bytes of application control data");
             stub_options.application = std::move(application);
             arg += 4;
+        } else if (option == "--title" && arg + 1 < argc) {
+            title = argv[++arg];
+        } else if (option == "--romfs" && arg + 1 < argc) {
+            stub_options.romfs = argv[++arg];
         } else {
             usage();
         }
     }
-    if (arg >= argc)
+    if (title ? arg != argc : arg >= argc)
         usage();
-    const char* module_path = argv[arg];
-    uint64_t stack_size = arg + 1 < argc ? std::strtoull(argv[arg + 1], nullptr, 0) : 0x10000;
-    stack_size = AlignUp(stack_size, 0x1000);
 
     Host host;
     g_host = &host;
     char trace[8] = {};
     host.trace = GetEnvironmentVariableA("RT_TRACE", trace, sizeof trace) > 0 && trace[0] != '0';
-    LoadElf(host.space, module_path);
+    if (title) {
+        LoadTitle(host.space, title, host.info);
+    } else {
+        LoadElf(host.space, argv[arg]);
+        if (arg + 1 < argc)
+            host.info.main_stack_size = std::strtoull(argv[arg + 1], nullptr, 0);
+    }
+    const uint64_t stack_size = AlignUp(host.info.main_stack_size, 0x1000);
 
     const uint64_t stack = Layout::kStackBase;
     if (!host.space.Map(stack, stack_size, kStateStack, kPermRW))
@@ -484,6 +586,8 @@ int main(int argc, char** argv) {
     if (GetEnvironmentVariableA("RT_BOOT_MODE", boot_mode, sizeof boot_mode) > 0)
         stub_options.boot_mode = static_cast<uint32_t>(std::strtoul(boot_mode, nullptr, 0));
     services::AddStubs(stubs, stub_options);
+    if (host.info.application)
+        services::AddApplicationServices(stubs, {host.info.program_id, host.trace});
     stubs.Start();
     char probe[8] = {};
     if (GetEnvironmentVariableA("RT_PROBE", probe, sizeof probe) > 0 && probe[0] != '0')

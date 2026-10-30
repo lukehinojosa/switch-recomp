@@ -1,6 +1,6 @@
 # switch-recomp plan
 
-Status: draft, 2026-10-30. This plan sets the direction for the whole
+Status: draft, 2026-10-30; phase 1 done, phase 2 next. This plan sets the direction for the whole
 project. The [sysmodule design draft](docs/recompiled-sysmodule-design.md)
 stays the detailed record of the first track (recompiled `pctl`), which is now
 phase 0 of the roadmap below.
@@ -220,11 +220,14 @@ Running a new game becomes one run that produces a report.
   - `nca.py`'s content tools;
   - a clean shadow of MK8D's `pctl` calls in mk8-recomp, and SSBU in
     WindowSmash using the recompiled module online.
-- **Not started:** the game interface, a game running on the host, graphics,
-  other platforms.
+- **Done in phase 1:** events across the link, the round-trip cost and the
+  decision it leads to, the game interface (version 1), and the Linux
+  platform layer with GCC (Clang waits for the toolchain in WSL).
+- **In progress:** the first game on the host (phase 1, milestone 4).
+- **Not started:** graphics, macOS and Android.
 - **Carried over from the design draft:** milestone 4 (reviewed frames)
   becomes part of the test harness; milestone 5's round-trip measurement and
-  copied handles across the link (`pctl` command 1432's event) move into
+  copied handles across the link (`pctl` command 1432's event) are done in
   phase 1.
 
 ## Roadmap
@@ -239,26 +242,87 @@ lifter and serving a real game's requests from recompiled firmware.
 
 ### Phase 1: foundations
 
-1. **Events across the link.** Copied handles reach the other process, so
-   `pctl` 1432's event can be waited on by the title. *Exit:* a test waits on
-   an event signalled by a module in another process; MK8D's shadow includes
-   1432.
-2. **Round-trip cost.** Measure a request across the link and in one process.
-   *Exit:* numbers recorded, and a decision on which services must run in
-   process.
-3. **The game interface, version 1.** Write the C ABI down: CPU state,
-   memory, supervisor calls, entry point, hooks. *Exit:* a header and a short
-   spec, reviewed against what `lift.py`, WindowSmash and mk8-recomp each
-   need.
-4. **The first game on the host.** Lift a game with `lift.py` (all of its
+1. **Events across the link. (Done.)** Copied handles reach the other
+   process, so `pctl` 1432's event can be waited on by the title. *Exit:* a
+   test waits on an event signalled by a module in another process; MK8D's
+   shadow includes 1432. The shadow found that firmware 23.0.1 refuses 1432
+   on the application port (see the design draft, milestone 5).
+2. **Round-trip cost. (Done.)** Measure a request across the link and in one
+   process. *Exit:* numbers recorded, and a decision on which services must
+   run in process. 2 µs in one kernel, 35 µs across the link, 43.5 µs for a
+   real `pctl` command: services called per frame run in the host process.
+3. **The game interface, version 1. (Done.)** Write the C ABI down: CPU
+   state, memory, supervisor calls, entry point, hooks. *Exit:* a header and
+   a short spec, reviewed against what `lift.py`, WindowSmash and mk8-recomp
+   each need: [include/hk/game.h](include/hk/game.h) and
+   [docs/game-interface.md](docs/game-interface.md).
+4. **The first game on the host. (Done.)** Lift a game with `lift.py` (all of its
    modules) and start it on the host kernel and `sm`, with only the services
    it asks for before its first frame. *Exit:* the game reaches its first GPU
    submission with no fault, and every service it touched is listed.
    Recommended title: MK8D, since its services are mapped, mk8-recomp's
    verified services are a reference, and its RomFS and system data already
-   build.
-5. **Linux platform layer.** *Exit:* every existing test passes on Linux
-   with GCC and Clang.
+   build. A first lift of its four modules (4.0.1) takes 17 s: 70,491
+   functions and 2.75 million instructions, 236 MB of C++ (`main` alone 189
+   MB). The steps:
+   1. **Lifter coverage. (Done.)** 8,723 sites used 61 instruction forms
+      the lifter did not translate: mostly single-precision scalar floating
+      point and a few NEON forms. Translating them made more code reachable
+      (2.82 million instructions in `main` instead of 2.28) and showed two
+      more rounds of forms, among them FRECPE and FRSQRTE, whose 8-bit
+      estimates follow the architecture's own algorithm. Now every module
+      lifts with no untranslated instruction except `udf` traps and four
+      data words inside the text. Every distinct floating-point and SIMD
+      word in the four modules (64,184 of them, over 678,683 cases) matches
+      unicorn.
+   2. **Several modules. (Done.)** Lift `rtld`, `main`, `subsdk0` and `sdk`
+      at the addresses the console loads them (one after another), with one
+      function table across them. `nso.py --exefs` lays the ExeFS out as
+      Horizon's loader does (MK8D: `0x7100000000` to `0x71024db000`) and
+      `lift.py --module` lifts the modules together, entered at `rtld`.
+      Functions a module exports are now entry points too, since other
+      modules reach them only through GOT slots `rtld` fills at run time;
+      that brought in 24,540 exports and far more reachable code: 94,978
+      functions and 4.47 million instructions, 446 MB of C++ in 240 files,
+      lifted in 30 s. The newly reachable code used a last set of forms
+      (AES, SHA-1, CRC32, long and saturating arithmetic, narrowing shifts,
+      the cache-type and DC ZVA registers), all added; the only traps left
+      are `udf` and data words in the text. difftest passes over every
+      instruction word in all four modules: `rtld` and `sdk` (159,918
+      words, 1.17 million cases), the floating-point and SIMD words of
+      `main` and `subsdk0`, and their 410,273 other words (2.2 million
+      cases, run after milestone 4). 84 loads and stores never ran, since
+      every random address they drew was unmapped in unicorn; words of the
+      same forms did run.
+   3. **Building it. (Done.)** MK8D's 446 MB of lifted C++ compiles and
+      links into `module_host` (129 MB) with no change to the generator:
+      129 s from scratch with Ninja and clang-cl on 20 threads, peak 0.9 GB
+      for the largest file (16 MB). The Visual Studio generator took 745 s,
+      running only two or three compiles at a time even with `/MP`, so
+      Ninja is the way to build a lifted title. Per file, clang-cl is about
+      twice as fast as MSVC (16.5 s against 37 s on the largest).
+   4. **The title host. (Done.)** `module_host --title` loads every module
+      at its place, starts `rtld`, and runs the title as an application
+      (heap, program id, memory pool from `main.npdm`). MK8D reaches its
+      first GPU submission with no fault: NVN binds the Maxwell 3D,
+      compute, DMA and inline-to-memory classes in 2,186 words through
+      `nvhost-gpu`. On the way it touched `sm` (over CMIF), `lm`, `apm`,
+      `appletOE`, `aoc:u`, four `pctl` ports, `fsp-srv` (RomFS from the
+      host's image), `nvdrv`, `vi`, `hid` and `time:u`, listed with every
+      command and ioctl in [docs/title-host.md](docs/title-host.md); it
+      waits for `acc:u0` next. The run found four lifter gaps (32-bit jump
+      tables, lazily bound GOT slots, `rtld`'s `bl` over a word, `adrp` and
+      `add` scheduled apart), now handled: 95,393 functions and 4.78
+      million instructions. Lifted files are cut by address and rewritten
+      only when they change, so a lifter fix rebuilds in about 20 s.
+5. **Linux platform layer. (Done.)** *Exit:* every existing test passes on
+   Linux with GCC and Clang. All seven pass with GCC 13 and Clang 18 in WSL
+   (Ubuntu 24.04), built with CMake and `-Wall -Wextra` with no warnings.
+   The CMake build found that the static libraries in the shared
+   `hk_module_client` must be position-independent, and the POSIX child
+   process helper waited out its full timeout on a child it had already
+   reaped (10 s in the transport test). `module_host` itself is still
+   Windows only.
 
 ### Phase 2: the operating system
 

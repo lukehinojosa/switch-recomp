@@ -54,6 +54,8 @@ public:
     // Commits [address, address+size) and records it. Fails if any page in
     // the range is already mapped. Page-aligned arguments only.
     bool Map(uint64_t address, uint64_t size, uint32_t state, uint32_t perm);
+    // Releases [address, address+size), which must be wholly mapped; regions
+    // at either edge are cut.
     bool Unmap(uint64_t address, uint64_t size);
     // The mapped region containing address, or the free gap around it.
     Region Query(uint64_t address) const;

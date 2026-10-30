@@ -36,6 +36,13 @@ struct Request {
     std::function<uint32_t(std::vector<std::byte>)> create_shared_memory;
     // Creates an event that is never signalled; returns its readable handle.
     std::function<uint32_t()> create_event;
+    // Creates an event the service signals and clears itself through its
+    // writable handle; returns {writable, readable}. Copy out the readable.
+    std::function<std::pair<uint32_t, uint32_t>()> create_event_pair;
+    std::function<void(uint32_t writable)> signal_event, clear_event;
+    // The client memory a copied transfer memory handle lends; false if the
+    // handle names none.
+    std::function<bool(uint32_t handle, hk::Kernel::TransferRange&)> transfer_memory;
 
     template <class T>
     T In(size_t offset) const {
@@ -47,8 +54,12 @@ struct Request {
     // The bytes of the first of statics or sends that is non-empty (the
     // "auto select" buffers clients send as both).
     std::vector<std::byte> InBuffer(size_t index = 0) const;
-    // Writes to the first non-empty of receives (B) at index.
+    // Writes to the B buffer at index, or, when the client passed none there
+    // (an "auto select" buffer sent as C), returns the bytes in the reply.
     bool OutBuffer(std::span<const std::byte> bytes, size_t index = 0) const;
+    // Output for the client's C buffers, by index, sent as X buffers in the
+    // reply; set by the host.
+    std::vector<std::vector<std::byte>>* pointer_out = nullptr;
 };
 
 struct Response {
@@ -81,7 +92,7 @@ public:
     NativeHost(const NativeHost&) = delete;
     NativeHost& operator=(const NativeHost&) = delete;
 
-    // Publishes a port; call before Start.
+    // Publishes a port; call before Start. Adding a name again replaces it.
     void Add(std::string name, uint32_t max_sessions, Factory factory);
     void Start();
 

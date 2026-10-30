@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -44,13 +45,15 @@ struct Vec {
 // host memory outside it.
 inline constexpr u64 kAddressMask = (u64{1} << 39) - 1;
 
+// Starts with the game interface's register prefix (hk_cpu_prefix in
+// include/hk/game.h): x0 to x30, sp, then the vector registers.
 struct Cpu {
     u64 x[31];
     u64 sp;
+    alignas(16) Vec q[32];
     // Only kept up to date by a lift with --track-pc, for debugging.
     u64 pc;
     u8 nf, zf, cf, vf;
-    Vec q[32];
     u64 fpcr, fpsr, tpidr, tpidrro;
     u8* mem;
     // Exclusive monitor: the address and value a load-exclusive observed.
@@ -216,61 +219,163 @@ inline T Rev16(T v) {
 
 // Floating point -----------------------------------------------------------
 
+// Scalar floating point works on float (S registers) and double (D). An S
+// or D result clears the rest of the vector register.
 inline double D(const Vec& v) { return std::bit_cast<double>(v.lo); }
+inline float F(const Vec& v) { return std::bit_cast<float>(static_cast<u32>(v.lo)); }
 inline Vec FromD(double d) { return Vec{std::bit_cast<u64>(d), 0}; }
+inline Vec FromF(float f) { return Vec{std::bit_cast<u32>(f), 0}; }
+inline Vec FromFp(double d) { return FromD(d); }
+inline Vec FromFp(float f) { return FromF(f); }
 inline u64 FloatBits(float f) { return std::bit_cast<u32>(f); }
+
+template <class T>
+using FpBits = std::conditional_t<sizeof(T) == 4, u32, u64>;
+template <class T>
+inline constexpr FpBits<T> kQuietBit = FpBits<T>{1} << (std::numeric_limits<T>::digits - 2);
+template <class T>
+inline constexpr FpBits<T> kSignBit = FpBits<T>{1} << (sizeof(T) * 8 - 1);
+template <class T>
+inline T DefaultNaN() {
+    return std::bit_cast<T>(static_cast<FpBits<T>>(sizeof(T) == 4 ? 0x7fc00000ull : 0x7ff8000000000000ull));
+}
+inline constexpr u64 kDefaultNaN = 0x7ff8000000000000ull;
 
 // Host arithmetic gives the right finite and infinite results. NaNs follow
 // the AArch64 rules instead of x86's: a signalling input is quietened and
 // wins, then the first quiet input in operand order, and an invalid
 // operation produces the positive default NaN.
-inline constexpr u64 kDefaultNaN = 0x7ff8000000000000ull;
-inline bool IsSNaN(double d) { return std::isnan(d) && !(std::bit_cast<u64>(d) & (u64{1} << 51)); }
-inline double Quiet(double d) { return std::bit_cast<double>(std::bit_cast<u64>(d) | (u64{1} << 51)); }
+template <class T>
+inline bool IsSNaN(T d) {
+    return std::isnan(d) && !(std::bit_cast<FpBits<T>>(d) & kQuietBit<T>);
+}
+template <class T>
+inline T Quiet(T d) {
+    return std::bit_cast<T>(static_cast<FpBits<T>>(std::bit_cast<FpBits<T>>(d) | kQuietBit<T>));
+}
+// FPNeg: flips the sign bit, NaNs included.
+template <class T>
+inline T Neg(T d) {
+    return std::bit_cast<T>(static_cast<FpBits<T>>(std::bit_cast<FpBits<T>>(d) ^ kSignBit<T>));
+}
 
-inline double FpResult(double r, double a, double b) {
+template <class T>
+inline T FpResult(T r, T a, T b) {
     if (IsSNaN(a)) return Quiet(a);
     if (IsSNaN(b)) return Quiet(b);
     if (std::isnan(a)) return a;
     if (std::isnan(b)) return b;
-    return std::isnan(r) ? std::bit_cast<double>(kDefaultNaN) : r;
+    return std::isnan(r) ? DefaultNaN<T>() : r;
 }
-inline double Fadd(double a, double b) { return FpResult(a + b, a, b); }
-inline double Fsub(double a, double b) { return FpResult(a - b, a, b); }
-inline double Fmul(double a, double b) { return FpResult(a * b, a, b); }
-inline double Fdiv(double a, double b) { return FpResult(a / b, a, b); }
-// FMADD d = a + n * m, NaNs checked in the order a, n, m.
-inline double Fmadd(double n, double m, double a) {
-    bool inf_times_zero = (std::isinf(n) && m == 0.0) || (n == 0.0 && std::isinf(m));
-    if (std::isnan(a) && !IsSNaN(a) && inf_times_zero) return std::bit_cast<double>(kDefaultNaN);
-    for (double v : {a, n, m})
-        if (IsSNaN(v)) return Quiet(v);
-    for (double v : {a, n, m})
-        if (std::isnan(v)) return v;
-    double r = std::fma(n, m, a);
-    return std::isnan(r) ? std::bit_cast<double>(kDefaultNaN) : r;
+template <class T>
+inline T FpResult1(T r, T a) {
+    if (std::isnan(a)) return Quiet(a);
+    return std::isnan(r) ? DefaultNaN<T>() : r;
+}
+template <class T> inline T Fadd(T a, T b) { return FpResult<T>(a + b, a, b); }
+template <class T> inline T Fsub(T a, T b) { return FpResult<T>(a - b, a, b); }
+template <class T> inline T Fmul(T a, T b) { return FpResult<T>(a * b, a, b); }
+template <class T> inline T Fdiv(T a, T b) { return FpResult<T>(a / b, a, b); }
+template <class T> inline T Fsqrt(T a) { return FpResult1<T>(std::sqrt(a), a); }
+
+// FMAX and FMIN: NaNs as for arithmetic; +0 is above -0.
+template <class T>
+inline T Fmax(T a, T b) {
+    if (std::isnan(a) || std::isnan(b)) return FpResult<T>(a, a, b);
+    if (a == b) return std::signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+template <class T>
+inline T Fmin(T a, T b) {
+    if (std::isnan(a) || std::isnan(b)) return FpResult<T>(a, a, b);
+    if (a == b) return std::signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+// FMAXNM and FMINNM: a quiet NaN against a number gives the number.
+template <class T>
+inline T Fmaxnm(T a, T b) {
+    if (std::isnan(a) && !IsSNaN(a) && !std::isnan(b)) return b;
+    if (std::isnan(b) && !IsSNaN(b) && !std::isnan(a)) return a;
+    return Fmax(a, b);
+}
+template <class T>
+inline T Fminnm(T a, T b) {
+    if (std::isnan(a) && !IsSNaN(a) && !std::isnan(b)) return b;
+    if (std::isnan(b) && !IsSNaN(b) && !std::isnan(a)) return a;
+    return Fmin(a, b);
 }
 
-inline void Fcmp(Cpu& c, double a, double b) {
+// FMADD d = a + n * m, NaNs checked in the order a, n, m. FMSUB, FNMADD and
+// FNMSUB negate their operands first (FPNeg), NaNs included.
+template <class T>
+inline T Fmadd(T n, T m, T a) {
+    bool inf_times_zero = (std::isinf(n) && m == T(0)) || (n == T(0) && std::isinf(m));
+    if (std::isnan(a) && !IsSNaN(a) && inf_times_zero) return DefaultNaN<T>();
+    for (T v : {a, n, m})
+        if (IsSNaN(v)) return Quiet(v);
+    for (T v : {a, n, m})
+        if (std::isnan(v)) return v;
+    T r = std::fma(n, m, a);
+    return std::isnan(r) ? DefaultNaN<T>() : r;
+}
+
+template <class T>
+inline void Fcmp(Cpu& c, T a, T b) {
     if (std::isnan(a) || std::isnan(b)) SetNzcv(c, 0b0011);
     else if (a == b) SetNzcv(c, 0b0110);
     else if (a < b) SetNzcv(c, 0b1000);
     else SetNzcv(c, 0b0010);
 }
 
-// FCVTZS/FCVTZU: truncate, saturate, NaN to zero.
-template <class I>
-inline I FcvtTrunc(double d) {
+// Rounding modes of FRINT* and FCVT*: N nearest even, P toward +inf, M
+// toward -inf, Z toward zero, A nearest away from zero.
+enum class Round { N, P, M, Z, A };
+template <class T>
+inline T RoundTo(T d, Round mode) {
+    switch (mode) {
+    case Round::N: return std::nearbyint(d); // the host's default mode is nearest even
+    case Round::P: return std::ceil(d);
+    case Round::M: return std::floor(d);
+    case Round::Z: return std::trunc(d);
+    case Round::A: return std::round(d);
+    }
+    return d;
+}
+template <class T>
+inline T Frint(T d, Round mode) {
+    return std::isnan(d) ? Quiet(d) : RoundTo(d, mode);
+}
+
+// FCVT* to an integer: round, saturate, NaN to zero. fbits is the fixed
+// point's fraction bits.
+template <class I, class T>
+inline I FcvtInt(T d, Round mode, int fbits = 0) {
     if (std::isnan(d)) return 0;
-    double t = std::trunc(d);
+    double t = RoundTo(static_cast<double>(d) * std::ldexp(1.0, fbits), mode);
     if (t <= static_cast<double>(std::numeric_limits<I>::min())) return std::numeric_limits<I>::min();
     if (t >= static_cast<double>(std::numeric_limits<I>::max())) return std::numeric_limits<I>::max();
     return static_cast<I>(t);
 }
+template <class I>
+inline I FcvtTrunc(double d) { return FcvtInt<I>(d, Round::Z); }
 inline u64 Fcvtzs64(double d) { return static_cast<u64>(FcvtTrunc<s64>(d)); }
 inline u32 Fcvtzs32(double d) { return static_cast<u32>(FcvtTrunc<s32>(d)); }
 inline u64 Fcvtzu64(double d) { return FcvtTrunc<u64>(d); }
 inline u32 Fcvtzu32(double d) { return FcvtTrunc<u32>(d); }
+
+// SCVTF and UCVTF, rounding once (a u64 through double would round twice).
+template <class T>
+inline T FromU64(u64 v) {
+    if (v >> 63 == 0) return static_cast<T>(static_cast<s64>(v));
+    return static_cast<T>(static_cast<s64>((v >> 1) | (v & 1))) * T(2);
+}
+template <class T, class I>
+inline T IntToFp(I v, int fbits = 0) {
+    T r;
+    if constexpr (std::is_same_v<I, u64>) r = FromU64<T>(v);
+    else r = static_cast<T>(v);
+    return fbits ? r / static_cast<T>(std::ldexp(1.0, fbits)) : r;
+}
 
 // Advanced SIMD --------------------------------------------------------------
 // size is log2 of the element width in bytes; q selects 128 bits over 64.
@@ -342,6 +447,472 @@ inline Vec VUminv(Vec a, u32 size, u32 q) {
     return Vec{m, 0};
 }
 
+inline u32 LaneCount(u32 size, u32 q) { return (q ? 16u : 8u) >> size; }
+inline s64 SLane(const Lanes& l, u32 size, u32 i) {
+    const u32 width = 8u << size;
+    const u64 v = GetLane(l, size, i);
+    return width == 64 ? static_cast<s64>(v) : static_cast<s64>(v << (64 - width)) >> (64 - width);
+}
+
+// Floating-point lanes: size 2 is float, 3 is double. op is applied to each
+// lane of a and b (b's lane index fixed when element is not negative).
+template <class Op>
+inline Vec VFp(Vec a, Vec b, u32 size, u32 q, int element, Op op) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const u32 j = element < 0 ? i : static_cast<u32>(element);
+        if (size == 2) {
+            const float v = op(std::bit_cast<float>(static_cast<u32>(GetLane(x, 2, i))),
+                               std::bit_cast<float>(static_cast<u32>(GetLane(y, 2, j))));
+            SetLane(r, 2, i, std::bit_cast<u32>(v));
+        } else {
+            const double v = op(std::bit_cast<double>(GetLane(x, 3, i)), std::bit_cast<double>(GetLane(y, 3, j)));
+            SetLane(r, 3, i, std::bit_cast<u64>(v));
+        }
+    }
+    return V(r);
+}
+inline Vec VFadd(Vec a, Vec b, u32 size, u32 q) {
+    return VFp(a, b, size, q, -1, [](auto x, auto y) { return Fadd(x, y); });
+}
+inline Vec VFsub(Vec a, Vec b, u32 size, u32 q) {
+    return VFp(a, b, size, q, -1, [](auto x, auto y) { return Fsub(x, y); });
+}
+inline Vec VFmul(Vec a, Vec b, u32 size, u32 q, int element = -1) {
+    return VFp(a, b, size, q, element, [](auto x, auto y) { return Fmul(x, y); });
+}
+
+// DUP (element), and the scalar copy of one element (DUP/MOV scalar).
+inline Vec VDupElem(Vec a, u32 size, u32 index, u32 q) { return Narrow(VDup(VLane(a, size, index), size, 1), q); }
+inline Vec VElem(Vec a, u32 size, u32 index) { return Vec{VLane(a, size, index), 0}; }
+// INS: one lane replaced, the rest kept.
+inline Vec VIns(Vec d, u32 size, u32 index, u64 v) {
+    Lanes r = L(d);
+    SetLane(r, size, index, v);
+    return V(r);
+}
+
+// SSHLL/USHLL (SXTL/UXTL): the lower or upper half (upper) widened, shifted.
+inline Vec VShll(Vec a, u32 size, u32 shift, bool upper, bool is_signed) {
+    Lanes x = L(a), r{};
+    const u32 base = upper ? (8u >> size) : 0;
+    for (u32 i = 0; i < (8u >> size); ++i) {
+        const u64 v = is_signed ? static_cast<u64>(SLane(x, size, base + i)) : GetLane(x, size, base + i);
+        SetLane(r, size + 1, i, v << shift);
+    }
+    return V(r);
+}
+// XTN/XTN2: each lane narrowed to half its width, into the lower half
+// (clearing the upper) or the upper half (keeping the lower).
+inline Vec VXtn(Vec d, Vec a, u32 size, bool upper) {
+    Lanes x = L(a), r = upper ? L(d) : Lanes{};
+    const u32 count = 8u >> size;
+    for (u32 i = 0; i < count; ++i) SetLane(r, size, (upper ? count : 0) + i, GetLane(x, size + 1, i));
+    return V(r);
+}
+// ZIP, UZP and TRN; part is 0 for the "1" forms and 1 for the "2" forms.
+inline Vec VZip(Vec a, Vec b, u32 size, u32 q, u32 part) {
+    Lanes x = L(a), y = L(b), r{};
+    const u32 n = LaneCount(size, q), base = part * n / 2;
+    for (u32 i = 0; i < n / 2; ++i) {
+        SetLane(r, size, 2 * i, GetLane(x, size, base + i));
+        SetLane(r, size, 2 * i + 1, GetLane(y, size, base + i));
+    }
+    return V(r);
+}
+inline Vec VUzp(Vec a, Vec b, u32 size, u32 q, u32 part) {
+    Lanes x = L(a), y = L(b), r{};
+    const u32 n = LaneCount(size, q);
+    for (u32 i = 0; i < n; ++i) {
+        const u32 from = 2 * i + part;
+        SetLane(r, size, i, from < n ? GetLane(x, size, from) : GetLane(y, size, from - n));
+    }
+    return V(r);
+}
+inline Vec VTrn(Vec a, Vec b, u32 size, u32 q, u32 part) {
+    Lanes x = L(a), y = L(b), r{};
+    const u32 n = LaneCount(size, q);
+    for (u32 i = 0; i < n / 2; ++i) {
+        SetLane(r, size, 2 * i, GetLane(x, size, 2 * i + part));
+        SetLane(r, size, 2 * i + 1, GetLane(y, size, 2 * i + part));
+    }
+    return V(r);
+}
+// TBL/TBX over a table of count consecutive registers (wrapping at 31).
+inline Vec VTbl(const Cpu& c, Vec d, u32 first, u32 count, Vec indices, u32 q, bool extension) {
+    Lanes table[4], idx = L(indices), r = extension ? L(d) : Lanes{};
+    for (u32 i = 0; i < count; ++i) table[i] = L(c.q[(first + i) % 32]);
+    for (u32 i = 0; i < (q ? 16u : 8u); ++i) {
+        const u32 at = idx.b[i];
+        if (at < count * 16) r.b[i] = table[at / 16].b[at % 16];
+    }
+    return Narrow(V(r), q);
+}
+inline Vec VMinMax(Vec a, Vec b, u32 size, u32 q, bool is_signed, bool max) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        u64 v;
+        if (is_signed) {
+            const s64 p = SLane(x, size, i), s = SLane(y, size, i);
+            v = static_cast<u64>(max ? std::max(p, s) : std::min(p, s));
+        } else {
+            const u64 p = GetLane(x, size, i), s = GetLane(y, size, i);
+            v = max ? std::max(p, s) : std::min(p, s);
+        }
+        SetLane(r, size, i, v);
+    }
+    return V(r);
+}
+inline Vec VCnt(Vec a, u32 q) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < (q ? 16u : 8u); ++i) r.b[i] = static_cast<u8>(std::popcount(x.b[i]));
+    return V(r);
+}
+// FMLA/FMLS: d + n*m (or d - n*m) per lane, fused, m's lane fixed when
+// element is not negative.
+inline Vec VFmla(Vec d, Vec n, Vec m, u32 size, u32 q, int element, bool subtract) {
+    Lanes acc = L(d), x = L(n), y = L(m), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const u32 j = element < 0 ? i : static_cast<u32>(element);
+        if (size == 2) {
+            float a = std::bit_cast<float>(static_cast<u32>(GetLane(acc, 2, i)));
+            float p = std::bit_cast<float>(static_cast<u32>(GetLane(x, 2, i)));
+            float s = std::bit_cast<float>(static_cast<u32>(GetLane(y, 2, j)));
+            SetLane(r, 2, i, std::bit_cast<u32>(Fmadd(subtract ? Neg(p) : p, s, a)));
+        } else {
+            double a = std::bit_cast<double>(GetLane(acc, 3, i));
+            double p = std::bit_cast<double>(GetLane(x, 3, i));
+            double s = std::bit_cast<double>(GetLane(y, 3, j));
+            SetLane(r, 3, i, std::bit_cast<u64>(Fmadd(subtract ? Neg(p) : p, s, a)));
+        }
+    }
+    return V(r);
+}
+// FCMEQ, FCMGE, FCMGT (register or against zero): all ones where true.
+enum class FpCompare { Eq, Ge, Gt, Le, Lt };
+inline Vec VFcm(Vec a, Vec b, u32 size, u32 q, FpCompare cmp) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        double p, s;
+        if (size == 2) {
+            p = std::bit_cast<float>(static_cast<u32>(GetLane(x, 2, i)));
+            s = std::bit_cast<float>(static_cast<u32>(GetLane(y, 2, i)));
+        } else {
+            p = std::bit_cast<double>(GetLane(x, 3, i));
+            s = std::bit_cast<double>(GetLane(y, 3, i));
+        }
+        bool t = false;
+        switch (cmp) {
+        case FpCompare::Eq: t = p == s; break;
+        case FpCompare::Ge: t = p >= s; break;
+        case FpCompare::Gt: t = p > s; break;
+        case FpCompare::Le: t = p <= s; break;
+        case FpCompare::Lt: t = p < s; break;
+        }
+        SetLane(r, size, i, t ? ~u64{0} : 0);
+    }
+    return V(r);
+}
+// CMEQ, CMGT, CMGE, CMHI, CMHS, CMTST (registers).
+enum class IntCompare { Eq, Gt, Ge, Hi, Hs, Tst };
+inline Vec VCm(Vec a, Vec b, u32 size, u32 q, IntCompare cmp) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const u64 p = GetLane(x, size, i), s = GetLane(y, size, i);
+        const s64 sp = SLane(x, size, i), ss = SLane(y, size, i);
+        bool t = false;
+        switch (cmp) {
+        case IntCompare::Eq: t = p == s; break;
+        case IntCompare::Gt: t = sp > ss; break;
+        case IntCompare::Ge: t = sp >= ss; break;
+        case IntCompare::Hi: t = p > s; break;
+        case IntCompare::Hs: t = p >= s; break;
+        case IntCompare::Tst: t = (p & s) != 0; break;
+        }
+        SetLane(r, size, i, t ? ~u64{0} : 0);
+    }
+    return V(r);
+}
+// SMAXV, SMINV (UMAXV and UMINV are above).
+inline Vec VSmaxv(Vec a, u32 size, u32 q, bool max) {
+    Lanes x = L(a);
+    s64 m = SLane(x, size, 0);
+    for (u32 i = 1; i < LaneCount(size, q); ++i) m = max ? std::max(m, SLane(x, size, i)) : std::min(m, SLane(x, size, i));
+    return Vec{static_cast<u64>(m) & (size == 3 ? ~u64{0} : (u64{1} << (8u << size)) - 1), 0};
+}
+// SADDLV, UADDLV: the sum of all lanes, one size wider.
+inline Vec VAddlv(Vec a, u32 size, u32 q, bool is_signed) {
+    Lanes x = L(a);
+    u64 sum = 0;
+    for (u32 i = 0; i < LaneCount(size, q); ++i) sum += is_signed ? static_cast<u64>(SLane(x, size, i)) : GetLane(x, size, i);
+    const u32 width = 16u << size;
+    return Vec{width == 64 ? sum : sum & ((u64{1} << width) - 1), 0};
+}
+inline Vec VMul(Vec a, Vec b, u32 size, u32 q, int element = -1) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i)
+        SetLane(r, size, i, GetLane(x, size, i) * GetLane(y, size, element < 0 ? i : static_cast<u32>(element)));
+    return V(r);
+}
+inline Vec VSub(Vec a, Vec b, u32 size, u32 q) {
+    Lanes x = L(a), y = L(b), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) SetLane(r, size, i, GetLane(x, size, i) - GetLane(y, size, i));
+    return V(r);
+}
+// SSHL, USHL: each lane shifted by the signed low byte of m's lane, left
+// when positive, right when negative.
+inline Vec VShlReg(Vec a, Vec b, u32 size, u32 q, bool is_signed) {
+    Lanes x = L(a), y = L(b), r{};
+    const int width = 8 << size;
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const int shift = static_cast<s8>(GetLane(y, size, i) & 0xff);
+        u64 v;
+        if (shift >= 0) {
+            v = shift >= width ? 0 : GetLane(x, size, i) << shift;
+        } else if (is_signed) {
+            const s64 s = SLane(x, size, i);
+            v = static_cast<u64>(-shift >= width ? (s < 0 ? -1 : 0) : s >> -shift);
+        } else {
+            v = -shift >= width ? 0 : GetLane(x, size, i) >> -shift;
+        }
+        SetLane(r, size, i, v);
+    }
+    return V(r);
+}
+// FADDP (vector): sums of adjacent pairs, a's pairs then b's.
+inline Vec VFaddp(Vec a, Vec b, u32 size, u32 q) {
+    Lanes x = L(a), y = L(b), r{};
+    const u32 n = LaneCount(size, q);
+    auto lane = [&](u32 i) { return i < n ? GetLane(x, size, i) : GetLane(y, size, i - n); };
+    for (u32 i = 0; i < n; ++i) {
+        if (size == 2)
+            SetLane(r, 2, i, std::bit_cast<u32>(Fadd(std::bit_cast<float>(static_cast<u32>(lane(2 * i))),
+                                                     std::bit_cast<float>(static_cast<u32>(lane(2 * i + 1))))));
+        else
+            SetLane(r, 3, i, std::bit_cast<u64>(Fadd(std::bit_cast<double>(lane(2 * i)), std::bit_cast<double>(lane(2 * i + 1)))));
+    }
+    return V(r);
+}
+// SCVTF, UCVTF (vector, integer) and FCVTZS, FCVTZU (vector).
+inline Vec VIntToFp(Vec a, u32 size, u32 q, bool is_signed) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const u64 v = GetLane(x, size, i);
+        if (size == 2)
+            SetLane(r, 2, i, std::bit_cast<u32>(is_signed ? IntToFp<float>(static_cast<s32>(v)) : IntToFp<float>(static_cast<u32>(v))));
+        else
+            SetLane(r, 3, i, std::bit_cast<u64>(is_signed ? IntToFp<double>(static_cast<s64>(v)) : IntToFp<double>(v)));
+    }
+    return V(r);
+}
+inline Vec VFcvtz(Vec a, u32 size, u32 q, bool is_signed) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const u64 v = GetLane(x, size, i);
+        if (size == 2) {
+            const float f = std::bit_cast<float>(static_cast<u32>(v));
+            SetLane(r, 2, i, is_signed ? static_cast<u32>(FcvtInt<s32>(f, Round::Z)) : FcvtInt<u32>(f, Round::Z));
+        } else {
+            const double d = std::bit_cast<double>(v);
+            SetLane(r, 3, i, is_signed ? static_cast<u64>(FcvtInt<s64>(d, Round::Z)) : FcvtInt<u64>(d, Round::Z));
+        }
+    }
+    return V(r);
+}
+inline Vec VShl(Vec a, u32 size, u32 shift, u32 q) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) SetLane(r, size, i, GetLane(x, size, i) << shift);
+    return V(r);
+}
+// NEG, ABS (vector).
+inline Vec VNegAbs(Vec a, u32 size, u32 q, bool neg) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        const s64 v = SLane(x, size, i);
+        SetLane(r, size, i, neg || v < 0 ? static_cast<u64>(0) - static_cast<u64>(v) : static_cast<u64>(v));
+    }
+    return V(r);
+}
+// EXT: bytes index.. of n:m, from the low byte of n.
+inline Vec VExt(Vec n, Vec m, u32 index, u32 q) {
+    Lanes x = L(n), y = L(m), r{};
+    const u32 bytes = q ? 16u : 8u;
+    for (u32 i = 0; i < bytes; ++i) {
+        const u32 at = index + i;
+        r.b[i] = at < bytes ? x.b[at] : y.b[at - bytes];
+    }
+    return V(r);
+}
+// REV16, REV32, REV64 (vector): elements reversed within each container.
+inline Vec VRev(Vec a, u32 size, u32 container, u32 q) {
+    Lanes x = L(a), r{};
+    const u32 per = container >> size;
+    for (u32 i = 0; i < (16u >> size); ++i) SetLane(r, size, i, GetLane(x, size, (i / per) * per + (per - 1 - i % per)));
+    return Narrow(V(r), q);
+}
+// FADDP (scalar): the sum of a pair.
+inline Vec Faddp(Vec a, u32 size) {
+    if (size == 2) return FromF(Fadd(std::bit_cast<float>(static_cast<u32>(a.lo)), std::bit_cast<float>(static_cast<u32>(a.lo >> 32))));
+    return FromD(Fadd(std::bit_cast<double>(a.lo), std::bit_cast<double>(a.hi)));
+}
+
+// FRECPE and FRSQRTE: the architecture's 8-bit estimates (FPRecipEstimate,
+// FPRSqrtEstimate), computed as its pseudocode does, without FPCR.FZ.
+inline u32 RecipEstimate(u32 a) { // a: 256..511
+    a = a * 2 + 1;
+    const u32 b = (1u << 19) / a;
+    return (b + 1) / 2;
+}
+inline u32 RecipSqrtEstimate(u32 a) { // a: 128..511
+    if (a < 256) {
+        a = a * 2 + 1;
+    } else {
+        a = (a >> 1) << 1;
+        a = (a + 1) * 2;
+    }
+    u64 b = 512;
+    while (u64{a} * (b + 1) * (b + 1) < (u64{1} << 28)) ++b;
+    return static_cast<u32>((b + 1) / 2);
+}
+template <class T>
+inline T Frecpe(T value) {
+    using B = FpBits<T>;
+    constexpr int N = sizeof(T) * 8, E = N == 32 ? 8 : 11, F = N - 1 - E;
+    const B bits = std::bit_cast<B>(value);
+    const B sign = bits & kSignBit<T>;
+    if (std::isnan(value)) return Quiet(value);
+    if (std::isinf(value)) return std::bit_cast<T>(sign);
+    if (value == T(0)) return std::bit_cast<T>(static_cast<B>(sign | std::bit_cast<B>(std::numeric_limits<T>::infinity())));
+    // Too small to have a representable reciprocal: overflow (round to nearest gives infinity).
+    if (std::abs(value) < std::ldexp(T(1), -(1 << (E - 1)))) {
+        return std::bit_cast<T>(static_cast<B>(sign | std::bit_cast<B>(std::numeric_limits<T>::infinity())));
+    }
+    // fraction as 52 bits, as the pseudocode widens it.
+    u64 fraction = static_cast<u64>(bits & ((B{1} << F) - 1)) << (52 - F);
+    s64 exp = static_cast<s64>((bits >> F) & ((B{1} << E) - 1));
+    if (exp == 0) {
+        if (!(fraction >> 51 & 1)) {
+            exp = -1;
+            fraction = (fraction & ((u64{1} << 50) - 1)) << 2;
+        } else {
+            fraction = (fraction & ((u64{1} << 51) - 1)) << 1;
+        }
+    }
+    const u32 scaled = static_cast<u32>(0x100 | (fraction >> 44 & 0xff));
+    s64 result_exp = (N == 32 ? 253 : 2045) - exp;
+    const u32 estimate = RecipEstimate(scaled);
+    fraction = u64{estimate & 0xff} << 44;
+    if (result_exp == 0) {
+        fraction = (u64{1} << 51) | (fraction >> 1);
+    } else if (result_exp == -1) {
+        fraction = (u64{1} << 50) | (fraction >> 2);
+        result_exp = 0;
+    }
+    const B out = static_cast<B>(sign | (static_cast<B>(result_exp & ((1 << E) - 1)) << F) |
+                                 static_cast<B>(fraction >> (52 - F)));
+    return std::bit_cast<T>(out);
+}
+template <class T>
+inline T Frsqrte(T value) {
+    using B = FpBits<T>;
+    constexpr int N = sizeof(T) * 8, E = N == 32 ? 8 : 11, F = N - 1 - E;
+    const B bits = std::bit_cast<B>(value);
+    const B sign = bits & kSignBit<T>;
+    if (std::isnan(value)) return Quiet(value);
+    if (value == T(0)) return std::bit_cast<T>(static_cast<B>(sign | std::bit_cast<B>(std::numeric_limits<T>::infinity())));
+    if (sign) return DefaultNaN<T>();
+    if (std::isinf(value)) return T(0);
+    u64 fraction = static_cast<u64>(bits & ((B{1} << F) - 1)) << (52 - F);
+    s64 exp = static_cast<s64>((bits >> F) & ((B{1} << E) - 1));
+    if (exp == 0) {
+        while (!(fraction >> 51 & 1)) {
+            fraction = (fraction << 1) & ((u64{1} << 52) - 1);
+            --exp;
+        }
+        fraction = (fraction << 1) & ((u64{1} << 52) - 1);
+    }
+    const u32 scaled = (exp & 1) == 0 ? static_cast<u32>(0x100 | (fraction >> 44 & 0xff))
+                                      : static_cast<u32>(0x80 | (fraction >> 45 & 0x7f));
+    const s64 result_exp = ((N == 32 ? 380 : 3068) - exp) / 2;
+    const u32 estimate = RecipSqrtEstimate(scaled);
+    const B out = static_cast<B>((static_cast<B>(result_exp & ((1 << E) - 1)) << F) |
+                                 (static_cast<B>(estimate & 0xff) << (F - 8)));
+    return std::bit_cast<T>(out);
+}
+// FRECPS: 2 - a*b, FRSQRTS: (3 - a*b) / 2, fused; infinity times zero gives
+// 2 and 1.5.
+template <class T>
+inline T Frecps(T a, T b) {
+    if (!std::isnan(a) && !std::isnan(b) && ((std::isinf(a) && b == T(0)) || (a == T(0) && std::isinf(b)))) return T(2);
+    return Fmadd(Neg(a), b, T(2));
+}
+// (3 - a*b) / 2 is rounded once, so it is computed as 1.5 - (a/2)*b with
+// the halving on an operand that halves exactly (not subnormal): halving
+// after the fused step would overflow where the true result does not.
+template <class T>
+inline T Frsqrts(T a, T b) {
+    if (std::isnan(a) || std::isnan(b)) return FpResult<T>(T(0), Neg(a), b);
+    if ((std::isinf(a) && b == T(0)) || (a == T(0) && std::isinf(b))) return T(1.5);
+    const bool a_halves = std::fpclassify(a) != FP_SUBNORMAL;
+    const T r = a_halves ? std::fma(-(a / T(2)), b, T(1.5)) : std::fma(-a, b / T(2), T(1.5));
+    return std::isnan(r) ? DefaultNaN<T>() : r;
+}
+// Lane-wise unary and binary floating-point operations by name.
+template <class Op>
+inline Vec VFp1(Vec a, u32 size, u32 q, Op op) {
+    Lanes x = L(a), r{};
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        if (size == 2)
+            SetLane(r, 2, i, std::bit_cast<u32>(op(std::bit_cast<float>(static_cast<u32>(GetLane(x, 2, i))))));
+        else
+            SetLane(r, 3, i, std::bit_cast<u64>(op(std::bit_cast<double>(GetLane(x, 3, i)))));
+    }
+    return V(r);
+}
+inline Vec VFrecpe(Vec a, u32 size, u32 q) { return VFp1(a, size, q, [](auto x) { return Frecpe(x); }); }
+inline Vec VFrsqrte(Vec a, u32 size, u32 q) { return VFp1(a, size, q, [](auto x) { return Frsqrte(x); }); }
+inline Vec VFabs(Vec a, u32 size, u32 q) {
+    return VFp1(a, size, q, [](auto x) { return std::signbit(x) ? Neg(x) : x; });
+}
+inline Vec VFneg(Vec a, u32 size, u32 q) { return VFp1(a, size, q, [](auto x) { return Neg(x); }); }
+inline Vec VFrecps(Vec a, Vec b, u32 size, u32 q) {
+    return VFp(a, b, size, q, -1, [](auto x, auto y) { return Frecps(x, y); });
+}
+inline Vec VFrsqrts(Vec a, Vec b, u32 size, u32 q) {
+    return VFp(a, b, size, q, -1, [](auto x, auto y) { return Frsqrts(x, y); });
+}
+// SSHR, USHR (immediate).
+inline Vec VShr(Vec a, u32 size, u32 shift, u32 q, bool is_signed) {
+    Lanes x = L(a), r{};
+    const u32 width = 8u << size;
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        u64 v;
+        if (is_signed) v = static_cast<u64>(shift >= width ? (SLane(x, size, i) < 0 ? -1 : 0) : SLane(x, size, i) >> shift);
+        else v = shift >= width ? 0 : GetLane(x, size, i) >> shift;
+        SetLane(r, size, i, v);
+    }
+    return V(r);
+}
+// ADDV: the sum of all lanes, at their own size.
+inline Vec VAddv(Vec a, u32 size, u32 q) {
+    Lanes x = L(a);
+    u64 sum = 0;
+    for (u32 i = 0; i < LaneCount(size, q); ++i) sum += GetLane(x, size, i);
+    return Vec{size == 3 ? sum : sum & ((u64{1} << (8u << size)) - 1), 0};
+}
+
+// PMULL/PMULL2 of 64-bit lanes: carry-less, into 128 bits.
+inline Vec Pmull64(u64 a, u64 b) {
+    u64 lo = 0, hi = 0;
+    for (int i = 0; i < 64; ++i) {
+        if (b >> i & 1) {
+            lo ^= a << i;
+            if (i) hi ^= a >> (64 - i);
+        }
+    }
+    return Vec{lo, hi};
+}
+
 struct Words {
     u32 w[4];
 };
@@ -383,6 +954,184 @@ inline Vec Sha256Su1(Vec d, Vec n, Vec m) {
     r.w[2] = sigma1(r.w[0]) + a.w[2] + t0[2];
     r.w[3] = sigma1(r.w[1]) + a.w[3] + t0[3];
     return FromW4(r);
+}
+
+// SHA-1: SHA1C, SHA1P and SHA1M (choose 0, parity 1, majority 2), SHA1H,
+// SHA1SU0 and SHA1SU1.
+inline Vec Sha1Hash(Vec xv, u32 y, Vec wv, int kind) {
+    Words x = W4(xv), w = W4(wv);
+    for (int e = 0; e < 4; ++e) {
+        u32 t;
+        if (kind == 0) t = (x.w[1] & x.w[2]) | (~x.w[1] & x.w[3]);
+        else if (kind == 1) t = x.w[1] ^ x.w[2] ^ x.w[3];
+        else t = (x.w[1] & x.w[2]) | (x.w[1] & x.w[3]) | (x.w[2] & x.w[3]);
+        y = y + std::rotl(x.w[0], 5) + t + w.w[e];
+        x.w[1] = std::rotl(x.w[1], 30);
+        // ROL(Y:X, 32)
+        const u32 top = x.w[3];
+        x = Words{{y, x.w[0], x.w[1], x.w[2]}};
+        y = top;
+    }
+    return FromW4(x);
+}
+inline Vec Sha1H(Vec n) { return Vec{std::rotl(static_cast<u32>(n.lo), 30), 0}; }
+inline Vec Sha1Su0(Vec d, Vec n, Vec m) {
+    const Vec t{d.hi, n.lo};
+    return Vec{t.lo ^ d.lo ^ m.lo, t.hi ^ d.hi ^ m.hi};
+}
+inline Vec Sha1Su1(Vec d, Vec n) {
+    Words a = W4(d), b = W4(n), t{}, r{};
+    t.w[0] = a.w[0] ^ b.w[1];
+    t.w[1] = a.w[1] ^ b.w[2];
+    t.w[2] = a.w[2] ^ b.w[3];
+    t.w[3] = a.w[3];
+    for (int i = 0; i < 4; ++i) r.w[i] = std::rotl(t.w[i], 1);
+    r.w[3] ^= std::rotl(t.w[0], 2);
+    return FromW4(r);
+}
+
+// AES: AESE (AddRoundKey, ShiftRows, SubBytes), AESD (the inverses), AESMC
+// and AESIMC (MixColumns and its inverse). The state is column-major: byte
+// r + 4c is row r of column c.
+inline constexpr u8 kAesSbox[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9,
+    0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, 0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f,
+    0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15, 0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07,
+    0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75, 0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3,
+    0x29, 0xe3, 0x2f, 0x84, 0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58,
+    0xcf, 0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8, 0x51, 0xa3,
+    0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, 0xcd, 0x0c, 0x13, 0xec, 0x5f,
+    0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73, 0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb, 0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac,
+    0x62, 0x91, 0x95, 0xe4, 0x79, 0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a,
+    0xae, 0x08, 0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a, 0x70,
+    0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, 0xe1, 0xf8, 0x98, 0x11,
+    0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf, 0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42,
+    0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16};
+inline u8 AesInvSbox(u8 v) {
+    static const auto table = [] {
+        std::array<u8, 256> t{};
+        for (int i = 0; i < 256; ++i) t[kAesSbox[i]] = static_cast<u8>(i);
+        return t;
+    }();
+    return table[v];
+}
+inline u8 AesTimes(u8 a, u8 b) { // multiplication in GF(2^8)
+    u8 r = 0;
+    for (; b; b >>= 1) {
+        if (b & 1) r ^= a;
+        a = static_cast<u8>((a << 1) ^ (a & 0x80 ? 0x1b : 0));
+    }
+    return r;
+}
+inline Vec Aese(Vec d, Vec n, bool decrypt) {
+    Lanes s = L(Vec{d.lo ^ n.lo, d.hi ^ n.hi}), r{};
+    for (int row = 0; row < 4; ++row)
+        for (int col = 0; col < 4; ++col) {
+            const int from = decrypt ? (col - row + 4) % 4 : (col + row) % 4;
+            const u8 v = s.b[row + 4 * from];
+            r.b[row + 4 * col] = decrypt ? AesInvSbox(v) : kAesSbox[v];
+        }
+    return V(r);
+}
+inline Vec Aesmc(Vec n, bool inverse) {
+    Lanes s = L(n), r{};
+    const u8 m[4] = {static_cast<u8>(inverse ? 14 : 2), static_cast<u8>(inverse ? 11 : 3),
+                     static_cast<u8>(inverse ? 13 : 1), static_cast<u8>(inverse ? 9 : 1)};
+    for (int col = 0; col < 4; ++col)
+        for (int row = 0; row < 4; ++row) {
+            u8 v = 0;
+            for (int k = 0; k < 4; ++k) v ^= AesTimes(s.b[4 * col + (row + k) % 4], m[k]);
+            r.b[4 * col + row] = v;
+        }
+    return V(r);
+}
+
+// SMULL, UMULL, SMLAL, UMLAL, SMLSL, UMLSL (vector): the lower (upper=false)
+// or upper half's lanes multiplied into double-width lanes; accumulate is 0
+// (multiply), 1 (add to d) or 2 (subtract from d).
+// With element not negative, every lane is multiplied by that lane of b (by
+// element forms).
+inline Vec VMull(Vec d, Vec a, Vec b, u32 size, bool upper, bool is_signed, int accumulate, int element = -1) {
+    Lanes x = L(a), y = L(b), acc = L(d), r{};
+    const u32 count = 8u >> size, base = upper ? count : 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 j = element < 0 ? base + i : static_cast<u32>(element);
+        u64 p = is_signed ? static_cast<u64>(SLane(x, size, base + i) * SLane(y, size, j))
+                          : GetLane(x, size, base + i) * GetLane(y, size, j);
+        if (accumulate == 1) p = GetLane(acc, size + 1, i) + p;
+        if (accumulate == 2) p = GetLane(acc, size + 1, i) - p;
+        SetLane(r, size + 1, i, p);
+    }
+    return V(r);
+}
+
+// SQSHRN, SQRSHRN, UQSHRN, UQRSHRN (and the "2" forms): each double-width
+// lane of n shifted right (rounded when round), saturated to size, into the
+// lower half (clearing the upper) or the upper half (keeping the lower).
+// FPSR.QC is not modelled.
+inline Vec VQShrn(Vec d, Vec n, u32 size, u32 shift, bool upper, bool round, bool is_signed) {
+    Lanes x = L(n), r = upper ? L(d) : Lanes{};
+    const u32 count = 8u >> size, width = 8u << size;
+    for (u32 i = 0; i < count; ++i) {
+        u64 v;
+        if (is_signed) {
+            const s64 s = SLane(x, size + 1, i);
+            s64 t = s >> shift;
+            if (round) t += (s >> (shift - 1)) & 1;
+            const s64 hi = (s64{1} << (width - 1)) - 1, lo = -hi - 1;
+            v = static_cast<u64>(std::clamp(t, lo, hi));
+        } else {
+            const u64 s = GetLane(x, size + 1, i);
+            u64 t = s >> shift;
+            if (round) t += (s >> (shift - 1)) & 1;
+            v = std::min(t, (u64{1} << width) - 1);
+        }
+        SetLane(r, size, (upper ? count : 0) + i, v);
+    }
+    return V(r);
+}
+
+// SQADD, UQADD, SQSUB, UQSUB (vector). FPSR.QC is not modelled.
+inline Vec VQAddSub(Vec a, Vec b, u32 size, u32 q, bool is_signed, bool subtract) {
+    Lanes x = L(a), y = L(b), r{};
+    const u32 width = 8u << size;
+    for (u32 i = 0; i < LaneCount(size, q); ++i) {
+        u64 v;
+        if (is_signed) {
+            const s64 p = SLane(x, size, i), s = SLane(y, size, i);
+            const s64 hi = width == 64 ? std::numeric_limits<s64>::max() : (s64{1} << (width - 1)) - 1;
+            const s64 lo = -hi - 1;
+            s64 t;
+            if (width == 64) {
+                const u64 up = static_cast<u64>(p), us = static_cast<u64>(s);
+                t = static_cast<s64>(subtract ? up - us : up + us);
+                const bool overflow = subtract ? ((p ^ s) & (p ^ t)) < 0 : ((p ^ t) & (s ^ t)) < 0;
+                if (overflow) t = p < 0 ? lo : hi;
+            } else {
+                t = std::clamp(subtract ? p - s : p + s, lo, hi);
+            }
+            v = static_cast<u64>(t);
+        } else {
+            const u64 p = GetLane(x, size, i), s = GetLane(y, size, i);
+            const u64 hi = width == 64 ? ~u64{0} : (u64{1} << width) - 1;
+            if (subtract) v = p < s ? 0 : p - s;
+            else v = (p > hi - s) ? hi : p + s;
+        }
+        SetLane(r, size, i, v);
+    }
+    return V(r);
+}
+
+// CRC32B/H/W/X and CRC32CB/H/W/X: bit-reflected, no inversion, as the
+// instructions define them.
+inline u32 Crc32(u32 crc, u64 data, int bytes, bool castagnoli) {
+    const u32 poly = castagnoli ? 0x82F63B78u : 0xEDB88320u;
+    for (int i = 0; i < bytes; ++i) {
+        crc ^= static_cast<u8>(data >> (8 * i));
+        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (poly & (0u - (crc & 1)));
+    }
+    return crc;
 }
 
 // Leaving lifted code --------------------------------------------------------

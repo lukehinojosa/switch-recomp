@@ -15,6 +15,10 @@ enum Command : uint32_t {
     Stats = 6,   // reply with the number of handles the server holds
     Buffers = 7, // takes X, A, B and W: writes B = A reversed, W = W + 1 per
                  // byte, replies with data {X size} and X reversed as an X
+    GetEvent = 8,    // copy back the readable end of the server's event
+    SignalIt = 9,    // signal the server's event
+    ClearIt = 10,    // clear it
+    IsSignaled = 11, // reply with {1} if the server sees it signalled, else {0}
 };
 
 // The server's receive list: one buffer every incoming X is packed into.

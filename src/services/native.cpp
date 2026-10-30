@@ -17,7 +17,9 @@ constexpr uint64_t kHandles = kBase + 0x200;    // wait list, up to 0x40 handles
 constexpr uint64_t kNames = kBase + 0x300;      // port name scratch
 constexpr uint64_t kReceive = kBase + 0x1000;   // where incoming X buffers land
 constexpr uint64_t kReceiveSize = 0x1000;
-constexpr uint64_t kMemorySize = 0x2000;
+constexpr uint64_t kReplyStatics = kBase + 0x2000; // X buffers a reply sends
+constexpr uint64_t kReplyStaticsSize = 0x10000;
+constexpr uint64_t kMemorySize = 0x2000 + kReplyStaticsSize;
 constexpr uint64_t kIpcArea = 64u << 20;
 constexpr uint64_t kProcessId = 3;
 constexpr uint32_t kMaxHandles = 0x40;
@@ -29,16 +31,7 @@ const hk::Result kUnknownCommand = MakeResult(10, 221);
 
 enum MessageType : uint32_t { Close = 2, Request4 = 4, Control = 5, RequestWithContext = 6, ControlWithContext = 7 };
 
-// Words before the data in a message with these parts.
-uint32_t DataWord(const Message& m) {
-    const bool special = m.send_pid || !m.copy.empty() || !m.move.empty();
-    return 2 + (special ? 1 : 0) + (m.send_pid ? 2 : 0) + static_cast<uint32_t>(m.copy.size() + m.move.size()) +
-           2 * static_cast<uint32_t>(m.statics.size()) +
-           3 * static_cast<uint32_t>(m.sends.size() + m.receives.size() + m.exchanges.size());
-}
-
-// The CMIF header starts at the first 16-byte boundary in the data.
-uint32_t Padding(const Message& m) { return (4 - DataWord(m) % 4) % 4; }
+uint32_t Padding(const Message& m) { return CmifPadding(m); }
 
 } // namespace
 
@@ -54,9 +47,14 @@ std::vector<std::byte> Request::InBuffer(size_t index) const {
 }
 
 bool Request::OutBuffer(std::span<const std::byte> bytes, size_t index) const {
-    if (index >= receives.size() || receives[index].size < bytes.size())
+    if (index < receives.size() && receives[index].size >= bytes.size() && receives[index].size)
+        return write(receives[index].address, bytes);
+    if (!pointer_out)
         return false;
-    return write(receives[index].address, bytes);
+    if (pointer_out->size() <= index)
+        pointer_out->resize(index + 1);
+    (*pointer_out)[index].assign(bytes.begin(), bytes.end());
+    return true;
 }
 
 struct NativeHost::State {
@@ -193,6 +191,8 @@ struct NativeHost::State {
 
         Request request;
         Response response;
+        std::vector<std::vector<std::byte>> pointer_out;
+        request.pointer_out = &pointer_out;
         hk::Result result = 0;
         if (end < at + 4 || data[at] != kInMagic) {
             result = kUnknownCommand;
@@ -221,6 +221,16 @@ struct NativeHost::State {
                 svc::CreateEvent(thread, writable, readable);
                 return readable;
             };
+            request.create_event_pair = [this] {
+                uint32_t writable = 0, readable = 0;
+                svc::CreateEvent(thread, writable, readable);
+                return std::pair{writable, readable};
+            };
+            request.signal_event = [this](uint32_t writable) { svc::SignalEvent(thread, writable); };
+            request.transfer_memory = [this](uint32_t handle, hk::Kernel::TransferRange& out) {
+                return kernel.FindTransferMemory(process, handle, out);
+            };
+            request.clear_event = [this](uint32_t writable) { svc::ClearEvent(thread, writable); };
             request.create_shared_memory = [this](std::vector<std::byte> contents) {
                 return kernel.CreateSharedMemory(process, std::move(contents));
             };
@@ -240,6 +250,19 @@ struct NativeHost::State {
                 }
                 std::fprintf(stderr, "native: %s%s command %u (%zu bytes in: %s) -> %08x\n", object->Name(),
                              control ? " control" : "", request.command, request.raw.size(), input.c_str(), result);
+            }
+        }
+        if (!result) {
+            // Output for C buffers goes back as X buffers; set before Finish,
+            // since their descriptors move the CMIF header.
+            uint64_t place = kReplyStatics;
+            for (uint32_t i = 0; i < pointer_out.size(); ++i) {
+                const auto& bytes = pointer_out[i];
+                if (place + bytes.size() > kReplyStatics + kReplyStaticsSize)
+                    break;
+                memory.Write(place, bytes);
+                reply.statics.push_back({place, bytes.size(), i});
+                place = (place + bytes.size() + 15) & ~uint64_t{15};
             }
         }
         Finish(reply, session, domain, result, std::move(response));
@@ -341,6 +364,12 @@ NativeHost::~NativeHost() {
 }
 
 void NativeHost::Add(std::string name, uint32_t max_sessions, Factory factory) {
+    for (auto& port : state_->ports) {
+        if (port.name == name) {
+            port = {std::move(name), max_sessions, std::move(factory)};
+            return;
+        }
+    }
     state_->ports.push_back({std::move(name), max_sessions, std::move(factory)});
 }
 

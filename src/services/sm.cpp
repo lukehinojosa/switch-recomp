@@ -4,6 +4,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +24,10 @@ hk::Result Err(uint32_t description) { return 0x15 | (description << 9); } // mo
 const hk::Result kInvalidClient = Err(2);
 const hk::Result kAlreadyRegistered = Err(4);
 const hk::Result kNotRegistered = Err(7);
+const hk::Result kUnknownCommand = 0xA | (221 << 9); // sf: the command is not served
+
+constexpr uint32_t kInMagic = 0x49434653;  // "SFCI"
+constexpr uint32_t kOutMagic = 0x4F434653; // "SFCO"
 
 std::string NameText(uint64_t name) {
     std::string text;
@@ -50,6 +55,8 @@ struct ServiceManager::State {
     // TIPC (the protocol sm speaks since 12.0.0): the message type is the
     // command id plus 16 and arguments follow the header as raw words. A
     // reply has the request's type, and its first data word is the result.
+    // Titles built with older SDKs still speak CMIF to sm, which it accepts
+    // too: the same commands behind a CMIF header.
     void Serve() {
         memory.WriteString(kName, "sm:");
         uint32_t port;
@@ -93,9 +100,7 @@ struct ServiceManager::State {
                 continue;
             }
             Message reply;
-            reply.type = request.type;
-            reply.data = {Dispatch(request, reply)};
-            if (reply.data[0] == kNotRegistered && request.type == 16 + 1) {
+            if (Answer(request, reply) == kNotRegistered && Command(request) == 1) {
                 // Like the real sm, hold GetServiceHandle until the service exists.
                 deferred.push_back({handles[index], request});
                 if (trace)
@@ -119,9 +124,7 @@ struct ServiceManager::State {
         retrying = true;
         for (auto it = deferred.begin(); it != deferred.end();) {
             Message reply;
-            reply.type = it->request.type;
-            reply.data = {Dispatch(it->request, reply)};
-            if (reply.data[0] == kNotRegistered) {
+            if (Answer(it->request, reply) == kNotRegistered) {
                 ++it;
                 continue;
             }
@@ -134,9 +137,54 @@ struct ServiceManager::State {
     }
     bool retrying = false;
 
-    hk::Result Dispatch(const Message& request, Message& reply) {
-        const uint32_t command = request.type >= 16 ? request.type - 16 : 0xffffffff;
-        auto word = [&](size_t i) { return i < request.data.size() ? request.data[i] : 0u; };
+    static bool IsCmif(const Message& m) { return m.type >= 4 && m.type <= 7; }
+
+    // Where a CMIF request's header is, or none.
+    static std::optional<size_t> CmifHeader(const Message& m) {
+        const size_t at = CmifPadding(m);
+        if (!IsCmif(m) || m.data.size() < at + 4 || m.data[at] != kInMagic)
+            return std::nullopt;
+        return at;
+    }
+
+    // The command a request names in either protocol; ~0 for none.
+    static uint32_t Command(const Message& m) {
+        if (m.type >= 16)
+            return m.type - 16;
+        const auto at = CmifHeader(m);
+        return at && (m.type == 4 || m.type == 6) ? m.data[*at + 2] : ~0u;
+    }
+
+    // Builds the reply to a request in its own protocol; returns the result.
+    hk::Result Answer(const Message& request, Message& reply) {
+        if (!IsCmif(request)) {
+            reply.type = request.type;
+            const hk::Result result = Dispatch(Command(request), request.data, reply);
+            reply.data = {result};
+            return result;
+        }
+        hk::Result result = kUnknownCommand;
+        std::vector<uint32_t> output;
+        if (const auto at = CmifHeader(request)) {
+            const std::vector<uint32_t> args(request.data.begin() + static_cast<ptrdiff_t>(*at + 4), request.data.end());
+            if (request.type == 4 || request.type == 6) {
+                result = Dispatch(request.data[*at + 2], args, reply);
+            } else if (request.data[*at + 2] == 3) { // control: QueryPointerBufferSize
+                result = 0;
+                output.push_back(0); // sm takes no pointer buffers
+            }
+        }
+        if (result)
+            reply.move.clear();
+        reply.type = 0;
+        reply.data.assign(CmifPadding(reply), 0);
+        reply.data.insert(reply.data.end(), {kOutMagic, 0, result, 0});
+        reply.data.insert(reply.data.end(), output.begin(), output.end());
+        return result;
+    }
+
+    hk::Result Dispatch(uint32_t command, const std::vector<uint32_t>& args, Message& reply) {
+        auto word = [&](size_t i) { return i < args.size() ? args[i] : 0u; };
         const uint64_t name = word(0) | static_cast<uint64_t>(word(1)) << 32;
         hk::Result result = 0;
         switch (command) {
@@ -179,7 +227,7 @@ struct ServiceManager::State {
         }
         if (trace && !(retrying && result == kNotRegistered)) {
             std::fprintf(stderr, "sm: command %u", command);
-            for (uint32_t w : request.data)
+            for (uint32_t w : args)
                 std::fprintf(stderr, " %08x", w);
             std::fprintf(stderr, " [%s] -> %08x\n", NameText(name).c_str(), result);
         }

@@ -18,8 +18,9 @@ public:
     virtual bool Write(std::span<const std::byte> in) = 0;
 };
 
-// Takes ownership of two pipe handles (Windows HANDLE values): one to read
-// from the peer, one to write to it.
+// Takes ownership of two handles: one to read from the peer, one to write to
+// it. On Windows these are pipe HANDLE values; elsewhere file descriptors of
+// pipes or sockets, two different ones.
 std::unique_ptr<ByteStream> OpenPipeStream(uintptr_t read_handle, uintptr_t write_handle);
 
 } // namespace hk

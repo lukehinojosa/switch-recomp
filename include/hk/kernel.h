@@ -2,7 +2,8 @@
 //
 // Implements the IPC subset a sysmodule server needs: named ports, sessions,
 // handle tables and HIPC message copy between processes with separate guest
-// address spaces, within one host process or across a link to another. Also
+// address spaces, within one host process or across a link to another (session
+// ends and readable events cross it). Also
 // the synchronization a guest runtime needs: thread and event objects,
 // WaitSynchronization and the address arbiter behind guest mutexes and
 // condition variables. Running threads is the caller's job.
@@ -12,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -102,6 +104,14 @@ public:
     // A process that maps it gets a copy of the contents at that moment:
     // later writes on either side are not seen by the other.
     uint32_t CreateSharedMemory(const std::shared_ptr<Process>& process, std::vector<std::byte> contents);
+    // Where the transfer memory a handle names lies: in its creator's memory,
+    // which the holder reads and writes in place. False if the handle names
+    // none, or it came from another kernel.
+    struct TransferRange {
+        GuestMemory* memory{};
+        uint64_t address{}, size{};
+    };
+    bool FindTransferMemory(const std::shared_ptr<Process>& process, uint32_t handle, TransferRange& out) const;
     // Closes every handle the process holds, waking peers as handles close.
     void DestroyProcess(const std::shared_ptr<Process>& process);
 
@@ -110,6 +120,15 @@ public:
     // handles may cross in messages. Exactly one side passes initiator=true.
     // If the stream fails, every session across it closes.
     void AttachLink(std::unique_ptr<ByteStream> stream, bool initiator);
+
+    // Calls watch with the signal state of a readable event the process
+    // holds, now and after every change, for host code that mirrors it into
+    // another kernel. watch runs with this kernel locked and must not call
+    // into it. Returns a token for Unwatch, or 0 if the handle is not a
+    // readable event. A readable event copied or moved across a link is a
+    // mirror of the event in the other kernel and is watched the same way.
+    uint64_t WatchEvent(const std::shared_ptr<Process>& process, uint32_t handle, std::function<void(bool)> watch);
+    void Unwatch(uint64_t token);
 
     size_t HandleCount(const std::shared_ptr<Process>& process) const;
 

@@ -1,6 +1,8 @@
 // The client side of a module host, for a title process: starts module_host
 // (or any host that takes --link) as a child process joined by a link, and
-// sends CMIF requests to the ports the module registers.
+// sends CMIF requests to the ports the module registers. On Windows the link
+// is two pipes and a job kills the child; elsewhere two socket pairs, and the
+// child gets PR_SET_PDEATHSIG (Linux).
 //
 // The client is one guest process in its own kernel, with one thread whose
 // message buffer every request uses; requests from different host threads
@@ -15,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -32,6 +35,8 @@ struct ModuleOptions {
 };
 
 class Session;
+class Event;
+struct EventMirror;
 
 struct Reply {
     // The SendSyncRequest result; anything but success means the session or
@@ -40,7 +45,8 @@ struct Reply {
     hk::Result result = 0;       // the CMIF result
     std::vector<std::byte> raw;  // output after the CMIF header, in whole words
     std::vector<std::shared_ptr<Session>> objects; // sessions the reply moved
-    size_t copied_handles = 0;   // copied handles, which are closed unused
+    std::vector<std::shared_ptr<Event>> events;    // readable events it copied or moved
+    size_t copied_handles = 0;   // other copied handles, which are closed unused
     bool malformed = false;      // the reply had no CMIF output header
 };
 
@@ -80,6 +86,35 @@ public:
 private:
     std::shared_ptr<ModuleLink::State> link_;
     uint32_t handle_;
+};
+
+// A readable event from the module: a mirror of the module's own event, kept
+// current over the link. Signalled only by the module; the title may wait on
+// it and clear it, as a game does with an event a service returns.
+class Event {
+public:
+    // Takes over handle, a readable event in the client's process. Null if it
+    // is not one.
+    static std::shared_ptr<Event> Adopt(const std::shared_ptr<ModuleLink::State>& link, uint32_t handle);
+    Event(std::shared_ptr<ModuleLink::State> link, uint32_t handle, std::shared_ptr<EventMirror> mirror);
+    ~Event();
+    Event(const Event&) = delete;
+    Event& operator=(const Event&) = delete;
+
+    bool Signaled() const;
+    // Waits until signalled or the timeout passes (negative: no timeout).
+    // True if signalled.
+    bool Wait(std::chrono::nanoseconds timeout);
+    void Clear();
+    // Calls on_change with the new state after every change (not now), on the
+    // link's thread. It must not call into the client; a title passes the
+    // state on to its own kernel's event. Replaces any earlier callback.
+    void Watch(std::function<void(bool)> on_change);
+
+private:
+    std::shared_ptr<ModuleLink::State> link_;
+    uint32_t handle_;
+    std::shared_ptr<EventMirror> mirror_;
 };
 
 } // namespace client

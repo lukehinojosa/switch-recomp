@@ -6,6 +6,7 @@
 #include "native.h"
 
 #include <optional>
+#include <string>
 
 namespace services {
 
@@ -22,6 +23,9 @@ struct StubOptions {
     uint32_t boot_mode = 1;
     // What arp:r reports as running; none means no process is an application.
     std::optional<Application> application;
+    // The running title's RomFS image, which fsp-srv serves as its data
+    // storage; none for a module.
+    std::string romfs;
     bool trace = false;
 };
 

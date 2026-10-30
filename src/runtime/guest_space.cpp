@@ -46,18 +46,54 @@ bool GuestSpace::Map(uint64_t address, uint64_t size, uint32_t state, uint32_t p
     // memory, and guest permission faults are not modelled yet.
     if (!VirtualAlloc(base_ + address, size, MEM_COMMIT, PAGE_READWRITE))
         return false;
-    regions_.emplace(address, Region{address, size, state, perm});
+    // Neighbours with the same state and permission become one region, as
+    // QueryMemory reports them on the console (a heap grown in steps, say).
+    Region r{address, size, state, perm};
+    if (next != regions_.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second.size == address && prev->second.state == state && prev->second.perm == perm) {
+            r.address = prev->first;
+            r.size += prev->second.size;
+            regions_.erase(prev);
+        }
+    }
+    if (next != regions_.end() && next->first == address + size && next->second.state == state &&
+        next->second.perm == perm) {
+        r.size += next->second.size;
+        regions_.erase(next);
+    }
+    regions_.emplace(r.address, r);
     return true;
 }
 
 bool GuestSpace::Unmap(uint64_t address, uint64_t size) {
-    std::lock_guard lock(mutex_);
-    auto it = regions_.find(address);
-    if (it == regions_.end() || it->second.size != size)
+    if (size == 0 || address % kPage || size % kPage || address + size > kSpaceSize)
         return false;
+    const uint64_t end = address + size;
+    std::lock_guard lock(mutex_);
+    // Every page in the range must be mapped; regions at either edge are cut.
+    auto it = regions_.upper_bound(address);
+    if (it == regions_.begin())
+        return false;
+    --it;
+    for (auto at = it; at != regions_.end() && at->first < end; ++at) {
+        const auto next = std::next(at);
+        const uint64_t region_end = at->first + at->second.size;
+        if (region_end < end && (next == regions_.end() || next->first != region_end))
+            return false;
+    }
+    if (it->first + it->second.size <= address)
+        return false;
+    while (it != regions_.end() && it->first < end) {
+        Region r = it->second;
+        it = regions_.erase(it);
+        if (r.address < address)
+            regions_.emplace(r.address, Region{r.address, address - r.address, r.state, r.perm});
+        if (r.address + r.size > end)
+            regions_.emplace(end, Region{end, r.address + r.size - end, r.state, r.perm});
+    }
     // Decommitting returns zeroed pages if the range is mapped again.
     VirtualFree(base_ + address, size, MEM_DECOMMIT);
-    regions_.erase(it);
     return true;
 }
 

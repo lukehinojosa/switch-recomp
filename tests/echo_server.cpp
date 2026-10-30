@@ -12,6 +12,7 @@ hk::Result RunServer(hk_thread* thread, FlatMemory& memory, uint64_t tls, uint64
 
     std::vector<uint32_t> handles{port}; // waited on
     std::vector<uint32_t> held;          // kept but not served
+    uint32_t writable = 0, readable = 0; // the event, made on first use
     const uint64_t receive_buffer = tls + ReceiveOffset, reply_static = tls + ReceiveOffset + ReceiveSize;
     // The receive list rides in every message the server leaves in its buffer,
     // after the data, where replies never reach.
@@ -96,6 +97,28 @@ hk::Result RunServer(hk_thread* thread, FlatMemory& memory, uint64_t tls, uint64
             reply.statics = {{reply_static, x.size(), 0}};
             break;
         }
+        case GetEvent:
+        case SignalIt:
+        case ClearIt:
+        case IsSignaled: {
+            if (!writable)
+                if (const auto e = svc::CreateEvent(thread, writable, readable))
+                    return e;
+            const uint32_t command = request.data[0];
+            if (command == GetEvent) {
+                reply.copy = {readable};
+            } else if (command == SignalIt) {
+                svc::SignalEvent(thread, writable);
+            } else if (command == ClearIt) {
+                svc::ClearEvent(thread, writable);
+            } else {
+                const uint32_t list[] = {readable};
+                memory.WriteWords(handle_list, list);
+                uint32_t ignored;
+                reply.data = {svc::WaitSynchronization(thread, handle_list, 1, 0, ignored) == Success ? 1u : 0u};
+            }
+            break;
+        }
         case Quit: {
             WriteMessage(memory, tls, reply);
             // Reply with nothing to wait on: the kernel replies, then times out.
@@ -105,6 +128,10 @@ hk::Result RunServer(hk_thread* thread, FlatMemory& memory, uint64_t tls, uint64
                 svc::CloseHandle(thread, handle);
             for (const uint32_t handle : held)
                 svc::CloseHandle(thread, handle);
+            if (writable) {
+                svc::CloseHandle(thread, writable);
+                svc::CloseHandle(thread, readable);
+            }
             return Success;
         }
         default:

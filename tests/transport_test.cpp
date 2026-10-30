@@ -2,15 +2,7 @@
 // (echo_host) with its own kernel, reached over a pipe link.
 #include "echo_server.h"
 #include "hk/link.h"
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef CreateProcess // a windows.h macro that would rename hk::Kernel::CreateProcess
+#include "linked_child.h"
 
 #include <chrono>
 #include <cstdio>
@@ -33,13 +25,6 @@ int failures = 0;
 
 constexpr uint64_t ClientBase = 0x20000000, ClientPid = 0x7c;
 
-std::wstring HostPath() {
-    wchar_t path[MAX_PATH];
-    const DWORD size = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring result(path, size);
-    return result.substr(0, result.find_last_of(L"\\/") + 1) + L"echo_host.exe";
-}
-
 struct World {
     static constexpr uint64_t ClientTls = ClientBase, ClientScratch = ClientBase + 0x200;
 
@@ -47,40 +32,14 @@ struct World {
         client = kernel.CreateProcess(ClientPid, client_memory);
         client_thread = kernel.CreateThread(client, ClientTls);
 
-        // to_host: we write, the host reads. from_host: the host writes, we read.
-        SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
-        HANDLE to_host_read, to_host_write, from_host_read, from_host_write;
-        CreatePipe(&to_host_read, &to_host_write, &inherit, 0);
-        CreatePipe(&from_host_read, &from_host_write, &inherit, 0);
-        SetHandleInformation(to_host_write, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(from_host_read, HANDLE_FLAG_INHERIT, 0);
-
-        std::wstring command = L"\"" + HostPath() + L"\" " +
-                               std::to_wstring(reinterpret_cast<uintptr_t>(to_host_read)) + L" " +
-                               std::to_wstring(reinterpret_cast<uintptr_t>(from_host_write));
-        STARTUPINFOW startup{};
-        startup.cb = sizeof startup;
-        PROCESS_INFORMATION info{};
-        const bool started =
-            CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &info);
-        CHECK(started);
-        CloseHandle(to_host_read);
-        CloseHandle(from_host_write);
-        host = info.hProcess;
-        CloseHandle(info.hThread);
-
-        kernel.AttachLink(hk::OpenPipeStream(reinterpret_cast<uintptr_t>(from_host_read),
-                                             reinterpret_cast<uintptr_t>(to_host_write)),
-                          true);
+        CHECK(host.Start(testing::Beside("echo_host")));
+        if (auto stream = host.TakeStream())
+            kernel.AttachLink(std::move(stream), true);
         session = Connect("echo");
     }
     ~World() {
         Stop();
         kernel.DestroyProcess(client);
-        if (host) {
-            TerminateProcess(host, 1);
-            CloseHandle(host);
-        }
     }
 
     hk::Result TryConnect(const char* name, uint32_t& handle) {
@@ -127,15 +86,14 @@ struct World {
     }
     // Asks the host to quit and checks that it exits cleanly.
     void Stop() {
-        if (!host || stopped)
+        if (!host.Started() || stopped)
             return;
         stopped = true;
         Message request, reply;
         request.data = {echo::Quit};
         CHECK(Call(session, request, reply) == Success);
-        CHECK(WaitForSingleObject(host, 10000) == WAIT_OBJECT_0);
-        DWORD code = 1;
-        GetExitCodeProcess(host, &code);
+        int code = 1;
+        CHECK(host.Wait(10000, code));
         CHECK(code == 0);
     }
 
@@ -143,7 +101,7 @@ struct World {
     FlatMemory client_memory{ClientBase, 0x1000};
     std::shared_ptr<hk::Process> client;
     hk_thread* client_thread{};
-    HANDLE host{};
+    testing::LinkedChild host;
     bool stopped = false;
     uint32_t session{};
 };
@@ -207,6 +165,94 @@ void CopiedHandleCrossesAndStays() {
     CHECK(svc::CloseHandle(world.client_thread, client_end) == Success);
 }
 
+// The server's event, copied to the client: a mirror the server's signals
+// and clears reach before the reply that follows them.
+uint32_t GetServerEvent(World& world) {
+    Message request, reply;
+    request.data = {echo::GetEvent};
+    CHECK(world.Call(world.session, request, reply) == Success);
+    CHECK(reply.copy.size() == 1);
+    return reply.copy.empty() ? 0 : reply.copy[0];
+}
+
+void Command(World& world, uint32_t command, std::vector<uint32_t>* data = nullptr) {
+    Message request, reply;
+    request.data = {command};
+    CHECK(world.Call(world.session, request, reply) == Success);
+    if (data)
+        *data = reply.data;
+}
+
+bool ClientSees(World& world, uint32_t event, int64_t timeout_ns = 0) {
+    const uint32_t list[] = {event};
+    world.client_memory.WriteWords(World::ClientScratch + 0x10, list);
+    uint32_t index;
+    return svc::WaitSynchronization(world.client_thread, World::ClientScratch + 0x10, 1, timeout_ns, index) == Success;
+}
+
+void EventSignalCrossesTheLink() {
+    World world;
+    const size_t before = world.kernel.HandleCount(world.client);
+    const uint32_t event = GetServerEvent(world);
+    CHECK(world.kernel.HandleCount(world.client) == before + 1);
+    CHECK(!ClientSees(world, event));
+    Command(world, echo::SignalIt);
+    CHECK(ClientSees(world, event)); // the change arrived before the reply
+    Command(world, echo::ClearIt);
+    CHECK(!ClientSees(world, event));
+    CHECK(svc::CloseHandle(world.client_thread, event) == Success);
+    CHECK(world.kernel.HandleCount(world.client) == before);
+}
+
+void EventClearCrossesBack() {
+    World world;
+    const uint32_t event = GetServerEvent(world);
+    Command(world, echo::SignalIt);
+    CHECK(ClientSees(world, event));
+    CHECK(svc::ClearEvent(world.client_thread, event) == Success);
+    CHECK(!ClientSees(world, event));
+    std::vector<uint32_t> seen;
+    Command(world, echo::IsSignaled, &seen); // the clear arrived before the request
+    CHECK(seen == std::vector<uint32_t>{0});
+    Command(world, echo::SignalIt);
+    CHECK(svc::ResetSignal(world.client_thread, event) == Success);
+    Command(world, echo::IsSignaled, &seen);
+    CHECK(seen == std::vector<uint32_t>{0});
+    CHECK(svc::ResetSignal(world.client_thread, event) == InvalidState);
+}
+
+void WaitOnMirrorWakesOnSignal() {
+    World world;
+    const uint32_t event = GetServerEvent(world);
+    constexpr uint64_t WaiterTls = ClientBase + 0xe00, WaiterList = ClientBase + 0xf00;
+    hk_thread* waiter = world.kernel.CreateThread(world.client, WaiterTls);
+    hk::Result waited = TimedOut;
+    std::thread thread([&] {
+        const uint32_t list[] = {event};
+        world.client_memory.WriteWords(WaiterList, list);
+        uint32_t index;
+        waited = svc::WaitSynchronization(waiter, WaiterList, 1, -1, index);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Command(world, echo::SignalIt);
+    thread.join();
+    CHECK(waited == Success);
+    world.kernel.DestroyThread(waiter);
+}
+
+void MirrorIsWatched() {
+    World world;
+    const uint32_t event = GetServerEvent(world);
+    std::vector<bool> states;
+    const uint64_t token = world.kernel.WatchEvent(world.client, event, [&](bool signaled) { states.push_back(signaled); });
+    CHECK(token != 0);
+    Command(world, echo::SignalIt);
+    Command(world, echo::ClearIt);
+    world.kernel.Unwatch(token);
+    Command(world, echo::SignalIt);
+    CHECK(states == (std::vector<bool>{false, true, false}));
+    CHECK(world.kernel.WatchEvent(world.client, world.session, [](bool) {}) == 0);
+}
 
 // Client-side layout for the Buffers command, in the client's scratch area.
 struct BufferCase {
@@ -278,8 +324,9 @@ void ServerQuitClosesSessions() {
 void HostCrashClosesSessions() {
     World world;
     CHECK(world.Echoes(world.session, {1}));
-    TerminateProcess(world.host, 3);
-    WaitForSingleObject(world.host, 10000);
+    world.host.Kill(3);
+    int code;
+    world.host.Wait(10000, code);
     world.stopped = true;
     // The link breaks when the reader sees the pipe close; until then a
     // request may still be queued, so wait for the result to settle.
@@ -322,6 +369,10 @@ int main() {
         {"SubInterfaceMovesAcrossTheLink", SubInterfaceMovesAcrossTheLink},
         {"ServerSessionMovesAcrossTheLink", ServerSessionMovesAcrossTheLink},
         {"CopiedHandleCrossesAndStays", CopiedHandleCrossesAndStays},
+        {"EventSignalCrossesTheLink", EventSignalCrossesTheLink},
+        {"EventClearCrossesBack", EventClearCrossesBack},
+        {"WaitOnMirrorWakesOnSignal", WaitOnMirrorWakesOnSignal},
+        {"MirrorIsWatched", MirrorIsWatched},
         {"BuffersCrossTheLink", BuffersCrossTheLink},
         {"ClientCloseReachesTheServer", ClientCloseReachesTheServer},
         {"ServerQuitClosesSessions", ServerQuitClosesSessions},

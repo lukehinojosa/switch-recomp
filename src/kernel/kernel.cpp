@@ -10,11 +10,13 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hk {
@@ -33,10 +35,14 @@ struct Object {
 struct ServerPort;
 struct Link;
 
-// A session end crossing a link, named by an id the exporting side chose.
-enum DescriptorKind : uint32_t { ClientEnd = 1, ServerEnd = 2 };
+// An object crossing a link, named by an id the exporting side chose: a
+// session end, or a readable event with its signal state at that moment. A
+// process crosses as its id alone (in generation).
+enum DescriptorKind : uint32_t { ClientEnd = 1, ServerEnd = 2, EventEnd = 3, ProcessEnd = 4 };
 struct Descriptor {
     uint32_t kind{}, id{};
+    uint32_t signaled{};
+    uint64_t generation{};
 };
 
 // A buffer a message carries, with the sender's bytes. ordinal counts X
@@ -117,11 +123,28 @@ struct ThreadObject final : Object {
     uint64_t id{};
 };
 
+// A handle to a process, as a copied current-process pseudo-handle gives a
+// server (am, for one, receives the application's).
+struct ProcessObject final : Object {
+    uint64_t id{};
+};
+
+// An event lives in one kernel. A readable end copied or moved across a link
+// becomes a mirror in the other kernel: the owner sends every change of the
+// signal state, and a mirror's clears go back to the owner. generation counts
+// signals, so the owner ignores a clear that a newer signal overtook.
 struct EventState {
     bool signaled{};
+    uint64_t generation{};
+    std::vector<std::pair<Link*, uint32_t>> exports; // the owner's mirrors
+    Link* owner_link{};                              // set on a mirror
+    uint32_t owner_id{};
+    std::map<uint64_t, std::function<void(bool)>> watchers; // Kernel::WatchEvent
 };
 
 struct ReadableEvent final : Object {
+    void LastHandleClosed() override;
+    Kernel::Impl* kernel{};
     std::shared_ptr<EventState> state;
 };
 
@@ -131,6 +154,13 @@ struct WritableEvent final : Object {
 
 struct SharedMemory final : Object {
     std::vector<std::byte> contents;
+};
+
+// A range of its creator's memory that a process lends to a server, which
+// works on it in place. It stays in this kernel: a link does not carry it.
+struct TransferMemory final : Object {
+    GuestMemory* memory{};
+    uint64_t address{}, size{};
 };
 
 // A thread blocked on a reply from across a link.
@@ -152,6 +182,8 @@ struct Link {
     // Guarded by the kernel lock.
     std::map<uint32_t, std::shared_ptr<ClientSession>> inbound; // our servers, the peer's clients
     std::map<uint32_t, std::weak_ptr<SessionState>> outbound;   // our clients, the peer's servers
+    std::map<uint32_t, std::shared_ptr<ReadableEvent>> exported_events; // ours, mirrored by the peer
+    std::map<uint32_t, std::shared_ptr<EventState>> mirrored_events;    // the peer's, from arrival to last close
     std::map<uint64_t, Waiter*> waiting;
     std::set<std::string> remote_ports;
     bool broken = false;
@@ -169,9 +201,13 @@ struct Link {
 
 class Process {
 public:
-    Process(uint64_t process_id, GuestMemory& guest_memory) : id(process_id), memory(guest_memory) {}
+    Process(uint64_t process_id, GuestMemory& guest_memory) : id(process_id), memory(guest_memory) {
+        self->id = process_id;
+    }
 
     std::shared_ptr<detail::Object> Find(uint32_t handle) const {
+        if (handle == static_cast<uint32_t>(HK_CURRENT_PROCESS))
+            return self;
         auto it = handles.find(handle);
         return it == handles.end() ? nullptr : it->second;
     }
@@ -210,6 +246,7 @@ public:
 
     const uint64_t id;
     GuestMemory& memory;
+    const std::shared_ptr<detail::ProcessObject> self = std::make_shared<detail::ProcessObject>();
     std::map<uint32_t, std::shared_ptr<detail::Object>> handles;
     uint32_t next_handle = 0x10;
 };
@@ -253,6 +290,9 @@ enum class Frame : uint32_t {
     Reply,              // tag, result, message
     Close,              // id: the peer closed its client end
     ServerClosed,       // id: the peer closed the server end
+    EventChanged,       // id, signaled, generation: an exported event's new state
+    EventCleared,       // id, generation: a mirror was cleared
+    EventClosed,        // id: the last handle to a mirror closed
 };
 constexpr uint32_t MaxBufferBytes = 64u << 20; // per message, all buffers together
 constexpr uint32_t MaxFrameBytes = MaxBufferBytes + 0x10000;
@@ -277,7 +317,7 @@ public:
             U32(word);
         U32(static_cast<uint32_t>(wire.descriptors.size()));
         for (const auto& descriptor : wire.descriptors)
-            U32(descriptor.kind).U32(descriptor.id);
+            U32(descriptor.kind).U32(descriptor.id).U32(descriptor.signaled).U64(descriptor.generation);
         U32(static_cast<uint32_t>(wire.buffers.size()));
         for (const auto& buffer : wire.buffers) {
             U32(buffer.kind).U32(buffer.ordinal).U64(buffer.address).U64(buffer.size);
@@ -343,6 +383,8 @@ public:
             Descriptor descriptor;
             descriptor.kind = U32();
             descriptor.id = U32();
+            descriptor.signaled = U32();
+            descriptor.generation = U64();
             wire.descriptors.push_back(descriptor);
         }
         const uint32_t buffers = U32();
@@ -457,9 +499,10 @@ Result Collect(Process& from, uint64_t tls, Envelope& envelope) {
         if (!object)
             return result::InvalidHandle;
         if (i >= layout.copy_count &&
-            std::find(envelope.source_handles.begin() + layout.copy_count, envelope.source_handles.end(), handle) !=
-                envelope.source_handles.end())
-            return result::InvalidHandle; // the same handle moved twice
+            (handle == static_cast<uint32_t>(HK_CURRENT_PROCESS) ||
+             std::find(envelope.source_handles.begin() + layout.copy_count, envelope.source_handles.end(), handle) !=
+                 envelope.source_handles.end()))
+            return result::InvalidHandle; // a pseudo-handle or the same handle moved
         envelope.objects.push_back(std::move(object));
         envelope.source_handles.push_back(handle);
     }
@@ -667,6 +710,9 @@ struct Kernel::Impl {
                     return result::NotImplemented;
                 if (!state.pending.empty() || state.current || HasRemoteClients(state))
                     return result::InvalidState;
+            } else if (auto* event = dynamic_cast<ReadableEvent*>(envelope.objects[i].get())) {
+                if (event->state->owner_link)
+                    return result::NotImplemented; // forwarding a mirror
             } else {
                 return result::NotImplemented; // ports and other objects stay local
             }
@@ -696,6 +742,17 @@ struct Kernel::Impl {
                     ++client->handle_refs; // a moved handle's reference passes to the link
                 link.inbound[id] = std::move(client);
                 wire.descriptors.push_back({ClientEnd, id});
+            } else if (auto event = std::dynamic_pointer_cast<ReadableEvent>(envelope.objects[i])) {
+                if (!move)
+                    ++event->handle_refs; // as for a client end
+                auto& state = *event->state;
+                state.exports.emplace_back(&link, id);
+                wire.descriptors.push_back({EventEnd, id, state.signaled, state.generation});
+                link.exported_events[id] = std::move(event);
+            } else if (auto process = std::dynamic_pointer_cast<ProcessObject>(envelope.objects[i])) {
+                wire.descriptors.push_back({ProcessEnd, id, 0, process->id});
+            } else if (!std::dynamic_pointer_cast<ServerSession>(envelope.objects[i])) {
+                wire.descriptors.push_back({0, id}); // nothing the other kernel can hold
             } else {
                 auto& state = *std::static_pointer_cast<ServerSession>(envelope.objects[i])->state;
                 state.server_link = &link;
@@ -722,7 +779,36 @@ struct Kernel::Impl {
             link.inbound[descriptor.id] = std::move(client);
             return std::make_shared<ServerSession>(state);
         }
+        if (descriptor.kind == EventEnd) {
+            auto it = link.mirrored_events.find(descriptor.id);
+            if (it == link.mirrored_events.end())
+                return nullptr;
+            auto event = std::make_shared<ReadableEvent>();
+            event->kernel = this;
+            event->state = it->second;
+            return event;
+        }
+        if (descriptor.kind == ProcessEnd) {
+            auto process = std::make_shared<ProcessObject>();
+            process->id = descriptor.generation;
+            return process;
+        }
         return nullptr;
+    }
+
+    // Creates the mirrors for the events in a message as it arrives, so that
+    // changes sent after it apply even before the message is delivered.
+    void AddMirrors(Link& link, const Wire& wire) {
+        for (const auto& descriptor : wire.descriptors) {
+            if (descriptor.kind != EventEnd || link.mirrored_events.contains(descriptor.id))
+                continue;
+            auto state = std::make_shared<EventState>();
+            state->signaled = descriptor.signaled != 0;
+            state->generation = descriptor.generation;
+            state->owner_link = &link;
+            state->owner_id = descriptor.id;
+            link.mirrored_events[descriptor.id] = std::move(state);
+        }
     }
 
     Result FromWire(Link& link, const Wire& wire, Envelope& envelope) {
@@ -816,10 +902,57 @@ struct Kernel::Impl {
         port.backlog.clear();
     }
 
+    // ---- Events ----
+
+    // Tells the event's mirrors its state, and its watchers and waiters too
+    // if the state changed from was.
+    void EventChanged(EventState& state, bool was) {
+        for (const auto& [link, id] : state.exports)
+            Send(*link, FrameWriter(Frame::EventChanged).U32(id).U32(state.signaled).U64(state.generation).Finish());
+        if (state.signaled == was)
+            return;
+        for (const auto& [token, watch] : state.watchers)
+            watch(state.signaled);
+        changed.notify_all();
+    }
+
+    void SignalState(EventState& state) {
+        const bool was = std::exchange(state.signaled, true);
+        ++state.generation;
+        EventChanged(state, was);
+    }
+
+    void ClearState(EventState& state) {
+        const bool was = std::exchange(state.signaled, false);
+        if (state.owner_link)
+            Send(*state.owner_link, FrameWriter(Frame::EventCleared).U32(state.owner_id).U64(state.generation).Finish());
+        EventChanged(state, was);
+    }
+
+    void CloseEvent(ReadableEvent& event) {
+        auto& state = *event.state;
+        if (Link* link = state.owner_link) {
+            Send(*link, FrameWriter(Frame::EventClosed).U32(state.owner_id).Finish());
+            link->mirrored_events.erase(state.owner_id);
+        }
+    }
+
+    // Drops the reference a link held for an event the peer mirrored.
+    void ReleaseExport(Link& link, const std::shared_ptr<ReadableEvent>& event, uint32_t id) {
+        std::erase(event->state->exports, std::pair{&link, id});
+        if (--event->handle_refs == 0)
+            event->LastHandleClosed();
+    }
+
     void BreakLink(Link& link) {
         if (link.broken)
             return;
         link.broken = true;
+        auto exported = std::move(link.exported_events);
+        link.exported_events.clear();
+        for (auto& [id, event] : exported)
+            ReleaseExport(link, event, id);
+        link.mirrored_events.clear(); // mirrors keep their last state
         for (auto& [id, weak] : link.outbound)
             if (auto state = weak.lock())
                 state->server_open = false;
@@ -906,6 +1039,7 @@ struct Kernel::Impl {
             Wire wire = in.Message();
             if (!in.Complete())
                 return false;
+            AddMirrors(link, wire);
             auto it = link.inbound.find(id);
             if (it == link.inbound.end() || !it->second->state->server_open) {
                 Send(link, FrameWriter(Frame::Reply).U64(tag).U32(result::SessionClosed).Message({}).Finish());
@@ -927,6 +1061,7 @@ struct Kernel::Impl {
             Wire wire = in.Message();
             if (!in.Complete())
                 return false;
+            AddMirrors(link, wire);
             auto it = link.waiting.find(tag);
             if (it == link.waiting.end()) {
                 DropWire(link, wire);
@@ -961,6 +1096,48 @@ struct Kernel::Impl {
                 if (auto state = it->second.lock())
                     state->server_open = false;
             changed.notify_all();
+            return true;
+        }
+        case Frame::EventChanged: {
+            const uint32_t id = in.U32();
+            const bool signaled = in.U32() != 0;
+            const uint64_t generation = in.U64();
+            if (!in.Complete())
+                return false;
+            auto it = link.mirrored_events.find(id);
+            if (it != link.mirrored_events.end()) { // else the mirror closed meanwhile
+                const bool was = std::exchange(it->second->signaled, signaled);
+                it->second->generation = generation;
+                EventChanged(*it->second, was);
+            }
+            return true;
+        }
+        case Frame::EventCleared: {
+            const uint32_t id = in.U32();
+            const uint64_t generation = in.U64();
+            if (!in.Complete())
+                return false;
+            auto it = link.exported_events.find(id);
+            if (it == link.exported_events.end())
+                return true;
+            auto& state = *it->second->state;
+            // A signal after the one the mirror saw stands.
+            if (state.signaled && state.generation == generation) {
+                state.signaled = false;
+                EventChanged(state, true);
+            }
+            return true;
+        }
+        case Frame::EventClosed: {
+            const uint32_t id = in.U32();
+            if (!in.Complete())
+                return false;
+            auto it = link.exported_events.find(id);
+            if (it != link.exported_events.end()) {
+                auto event = std::move(it->second);
+                link.exported_events.erase(it);
+                ReleaseExport(link, event, id);
+            }
             return true;
         }
         }
@@ -1357,10 +1534,24 @@ struct Kernel::Impl {
         return result::Success;
     }
 
+    // CreateTransferMemory(address, size, permission) -> handle
+    Result CreateTransferMemory(hk_thread& t, hk_regs& r) {
+        const uint64_t address = r.x[1], size = r.x[2];
+        if (address % 0x1000 || size == 0 || size % 0x1000)
+            return result::InvalidAddress;
+        auto memory = std::make_shared<TransferMemory>();
+        memory->memory = &t.process->memory;
+        memory->address = address;
+        memory->size = size;
+        r.x[1] = t.process->Add(std::move(memory));
+        return result::Success;
+    }
+
     Result CreateEvent(hk_thread& t, hk_regs& r) {
         auto state = std::make_shared<EventState>();
         auto writable = std::make_shared<WritableEvent>();
         auto readable = std::make_shared<ReadableEvent>();
+        readable->kernel = this;
         writable->state = readable->state = state;
         r.x[1] = t.process->Add(std::move(writable));
         r.x[2] = t.process->Add(std::move(readable));
@@ -1371,17 +1562,16 @@ struct Kernel::Impl {
         auto event = t.process->Get<WritableEvent>(static_cast<uint32_t>(r.x[0]));
         if (!event)
             return result::InvalidHandle;
-        event->state->signaled = true;
-        changed.notify_all();
+        SignalState(*event->state);
         return result::Success;
     }
 
     Result ClearEvent(hk_thread& t, hk_regs& r) {
         auto object = t.process->Find(static_cast<uint32_t>(r.x[0]));
         if (auto* writable = dynamic_cast<WritableEvent*>(object.get()))
-            writable->state->signaled = false;
+            ClearState(*writable->state);
         else if (auto* readable = dynamic_cast<ReadableEvent*>(object.get()))
-            readable->state->signaled = false;
+            ClearState(*readable->state);
         else
             return result::InvalidHandle;
         return result::Success;
@@ -1393,7 +1583,7 @@ struct Kernel::Impl {
             return result::InvalidHandle;
         if (!event->state->signaled)
             return result::InvalidState;
-        event->state->signaled = false;
+        ClearState(*event->state);
         return result::Success;
     }
 
@@ -1629,6 +1819,8 @@ struct Kernel::Impl {
     std::deque<hk_thread*> cv_waiters;    // waiting on a condition variable key
     std::vector<std::unique_ptr<Link>> links;
     std::vector<std::unique_ptr<Request>> remote_requests;
+    std::map<uint64_t, std::weak_ptr<EventState>> watches;
+    uint64_t next_watch = 1;
 };
 
 namespace detail {
@@ -1636,6 +1828,7 @@ namespace detail {
 void ServerSession::LastHandleClosed() { state->kernel->CloseServer(*state); }
 void ClientSession::LastHandleClosed() { state->kernel->CloseClient(*state); }
 void ServerPort::LastHandleClosed() { kernel->ClosePort(*this); }
+void ReadableEvent::LastHandleClosed() { kernel->CloseEvent(*this); }
 
 } // namespace detail
 
@@ -1696,6 +1889,15 @@ uint32_t Kernel::CreateSharedMemory(const std::shared_ptr<Process>& process, std
     return process->Add(std::move(memory));
 }
 
+bool Kernel::FindTransferMemory(const std::shared_ptr<Process>& process, uint32_t handle, TransferRange& out) const {
+    std::lock_guard lock(impl_->mutex);
+    auto memory = process->Get<TransferMemory>(handle);
+    if (!memory)
+        return false;
+    out = {memory->memory, memory->address, memory->size};
+    return true;
+}
+
 void Kernel::DestroyProcess(const std::shared_ptr<Process>& process) {
     std::lock_guard lock(impl_->mutex);
     while (!process->handles.empty())
@@ -1718,6 +1920,29 @@ void Kernel::AttachLink(std::unique_ptr<ByteStream> stream, bool initiator) {
     }
     link->writer.Start([this, link] { impl_->WriteLoop(*link); });
     link->reader.Start([this, link] { impl_->ReadLoop(*link); });
+}
+
+uint64_t Kernel::WatchEvent(const std::shared_ptr<Process>& process, uint32_t handle,
+                            std::function<void(bool)> watch) {
+    std::lock_guard lock(impl_->mutex);
+    auto event = process->Get<ReadableEvent>(handle);
+    if (!event)
+        return 0;
+    const uint64_t token = impl_->next_watch++;
+    watch(event->state->signaled);
+    event->state->watchers.emplace(token, std::move(watch));
+    impl_->watches.emplace(token, event->state);
+    return token;
+}
+
+void Kernel::Unwatch(uint64_t token) {
+    std::lock_guard lock(impl_->mutex);
+    auto it = impl_->watches.find(token);
+    if (it == impl_->watches.end())
+        return;
+    if (auto state = it->second.lock())
+        state->watchers.erase(token);
+    impl_->watches.erase(it);
 }
 
 size_t Kernel::HandleCount(const std::shared_ptr<Process>& process) const {
@@ -1753,6 +1978,7 @@ extern "C" void hk_svc(hk_thread* thread, uint32_t id, hk_regs* regs) {
     case HK_SVC_CREATE_SHARED_MEMORY: result = kernel.CreateSharedMemory(*thread, *regs); break;
     case HK_SVC_MAP_SHARED_MEMORY: result = kernel.MapSharedMemory(*thread, *regs); break;
     case HK_SVC_UNMAP_SHARED_MEMORY: result = kernel.UnmapSharedMemory(*thread, *regs); break;
+    case HK_SVC_CREATE_TRANSFER_MEMORY: result = kernel.CreateTransferMemory(*thread, *regs); break;
     default: result = hk::result::NotImplemented; break;
     }
     regs->x[0] = result;

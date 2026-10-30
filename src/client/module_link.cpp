@@ -3,6 +3,7 @@
 #include "hk/link.h"
 #include "hk/native.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,8 +12,18 @@
 #endif
 #include <windows.h>
 #undef CreateProcess
+#else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -27,6 +38,7 @@ constexpr uint64_t kTls = kBase;
 constexpr uint64_t kName = kBase + 0x200;
 constexpr uint32_t kInMagic = 0x49434653, kOutMagic = 0x4F434653; // "SFCI", "SFCO"
 
+#ifdef _WIN32
 // Quotes one argument for CreateProcessW's command line.
 std::wstring Quote(const std::wstring& argument) {
     std::wstring out = L"\"";
@@ -56,6 +68,11 @@ std::wstring Widen(const std::string& text) {
 [[noreturn]] void Throw(const char* what) {
     throw std::runtime_error(std::string(what) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
+#else
+[[noreturn]] void Throw(const char* what, int error = errno) {
+    throw std::runtime_error(std::string(what) + " (" + std::strerror(error) + ")");
+}
+#endif
 
 } // namespace
 
@@ -65,11 +82,18 @@ struct ModuleLink::State {
     hk::Kernel kernel;
     std::shared_ptr<hk::Process> process;
     hk_thread* thread = nullptr;
+#ifdef _WIN32
     HANDLE child = nullptr, job = nullptr;
+#else
+    pid_t child = 0;
+    std::mutex reap;
+    bool exited = false;
+#endif
 
     ~State() {
         if (process)
             kernel.DestroyProcess(process);
+#ifdef _WIN32
         if (child) {
             TerminateProcess(child, 1);
             WaitForSingleObject(child, INFINITE);
@@ -77,12 +101,20 @@ struct ModuleLink::State {
         }
         if (job)
             CloseHandle(job);
+#else
+        if (child && !exited) {
+            kill(child, SIGKILL);
+            waitpid(child, nullptr, 0);
+        }
+#endif
     }
 };
 
-std::shared_ptr<ModuleLink> ModuleLink::Start(const ModuleOptions& options) {
-    auto state = std::make_shared<State>();
+namespace {
 
+#ifdef _WIN32
+// Starts the host with the link's pipes; returns the stream to it.
+std::unique_ptr<hk::ByteStream> StartChild(ModuleLink::State& state, const ModuleOptions& options) {
     // to_child: we write, the child reads. from_child: the child writes.
     SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
     HANDLE to_child_read, to_child_write, from_child_read, from_child_write;
@@ -137,10 +169,10 @@ std::shared_ptr<ModuleLink> ModuleLink::Start(const ModuleOptions& options) {
 
     // A job that kills the child when its last handle closes, which happens
     // when this process ends for any reason.
-    state->job = CreateJobObjectW(nullptr, nullptr);
+    state.job = CreateJobObjectW(nullptr, nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!state->job || !SetInformationJobObject(state->job, JobObjectExtendedLimitInformation, &limits, sizeof limits))
+    if (!state.job || !SetInformationJobObject(state.job, JobObjectExtendedLimitInformation, &limits, sizeof limits))
         Throw("could not create a job for the child");
 
     PROCESS_INFORMATION info{};
@@ -152,14 +184,85 @@ std::shared_ptr<ModuleLink> ModuleLink::Start(const ModuleOptions& options) {
     CloseHandle(from_child_write);
     if (!started)
         Throw("could not start the module host");
-    state->child = info.hProcess;
-    if (!AssignProcessToJobObject(state->job, info.hProcess)) {
+    state.child = info.hProcess;
+    if (!AssignProcessToJobObject(state.job, info.hProcess)) {
         CloseHandle(info.hThread);
         Throw("could not place the module host in its job");
     }
     ResumeThread(info.hThread);
     CloseHandle(info.hThread);
+    return stream;
+}
+#else
+std::unique_ptr<hk::ByteStream> StartChild(ModuleLink::State& state, const ModuleOptions& options) {
+    // One socket pair per direction, so that a write to a child that has
+    // gone fails instead of raising SIGPIPE. status reports a failed exec.
+    int to_child[2], from_child[2], status[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, to_child))
+        Throw("could not create a socket pair");
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, from_child)) {
+        close(to_child[0]);
+        close(to_child[1]);
+        Throw("could not create a socket pair");
+    }
+    if (pipe2(status, O_CLOEXEC)) {
+        for (int fd : {to_child[0], to_child[1], from_child[0], from_child[1]})
+            close(fd);
+        Throw("could not create a pipe");
+    }
+    // The link owns our ends from here, including on failure below.
+    auto stream = hk::OpenPipeStream(static_cast<uintptr_t>(from_child[0]), static_cast<uintptr_t>(to_child[1]));
 
+    const std::string executable = std::filesystem::absolute(options.executable).string();
+    std::vector<std::string> arguments{executable, "--link", std::to_string(to_child[0]), std::to_string(from_child[1])};
+    arguments.insert(arguments.end(), options.arguments.begin(), options.arguments.end());
+    std::vector<char*> argv;
+    for (auto& argument : arguments)
+        argv.push_back(argument.data());
+    argv.push_back(nullptr);
+
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid == 0) {
+        // The child dies with this process, as a Windows job would see to.
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() != parent)
+            _exit(127);
+        // Its two link ends survive the exec; everything else marked
+        // close-on-exec does not.
+        fcntl(to_child[0], F_SETFD, 0);
+        fcntl(from_child[1], F_SETFD, 0);
+        execv(argv[0], argv.data());
+        const int error = errno;
+        (void)!write(status[1], &error, sizeof error);
+        _exit(127);
+    }
+    const int fork_error = errno;
+    close(to_child[0]);
+    close(from_child[1]);
+    close(status[1]);
+    if (pid < 0) {
+        close(status[0]);
+        Throw("could not start the module host", fork_error);
+    }
+    state.child = pid;
+    int error = 0;
+    const ssize_t got = read(status[0], &error, sizeof error);
+    close(status[0]);
+    if (got == sizeof error) {
+        waitpid(pid, nullptr, 0);
+        state.exited = true;
+        Throw("could not start the module host", error);
+    }
+    return stream;
+}
+#endif
+
+} // namespace
+
+std::shared_ptr<ModuleLink> ModuleLink::Start(const ModuleOptions& options) {
+    auto state = std::make_shared<State>();
+    auto stream = StartChild(*state, options);
     state->process = state->kernel.CreateProcess(options.process_id, state->memory);
     state->thread = state->kernel.CreateThread(state->process, kTls);
     state->kernel.AttachLink(std::move(stream), true);
@@ -188,7 +291,16 @@ std::shared_ptr<Session> ModuleLink::Connect(std::string_view port, std::chrono:
     }
 }
 
+#ifdef _WIN32
 bool ModuleLink::Running() const { return WaitForSingleObject(state_->child, 0) == WAIT_TIMEOUT; }
+#else
+bool ModuleLink::Running() const {
+    std::lock_guard guard(state_->reap);
+    if (!state_->exited && waitpid(state_->child, nullptr, WNOHANG) == state_->child)
+        state_->exited = true;
+    return !state_->exited;
+}
+#endif
 
 Session::Session(std::shared_ptr<ModuleLink::State> link, uint32_t handle)
     : link_(std::move(link)), handle_(handle) {}
@@ -224,12 +336,21 @@ Reply Session::Request(uint32_t command, std::span<const std::byte> raw, bool se
         if (reply.kernel)
             return reply;
         message = ReadMessage(link_->memory, kTls);
-        for (uint32_t handle : message.copy)
-            svc::CloseHandle(link_->thread, handle);
+        for (uint32_t handle : message.copy) {
+            if (auto event = Event::Adopt(link_, handle)) {
+                reply.events.push_back(std::move(event));
+            } else {
+                svc::CloseHandle(link_->thread, handle);
+                ++reply.copied_handles;
+            }
+        }
     }
-    reply.copied_handles = message.copy.size();
-    for (uint32_t handle : message.move)
-        reply.objects.push_back(std::make_shared<Session>(link_, handle));
+    for (uint32_t handle : message.move) {
+        if (auto event = Event::Adopt(link_, handle))
+            reply.events.push_back(std::move(event));
+        else
+            reply.objects.push_back(std::make_shared<Session>(link_, handle));
+    }
     const uint32_t reply_word = 2 + (message.move.empty() && message.copy.empty() ? 0 : 1) +
                                 static_cast<uint32_t>(message.move.size() + message.copy.size());
     const size_t reply_pad = (4 - reply_word % 4) % 4;
@@ -247,6 +368,67 @@ Reply Session::Request(uint32_t command, std::span<const std::byte> raw, bool se
         reply.raw.insert(reply.raw.end(), bytes, bytes + 4);
     }
     return reply;
+}
+
+struct EventMirror {
+    std::mutex lock;
+    std::condition_variable changed;
+    bool signaled = false;
+    std::function<void(bool)> on_change;
+    uint64_t watch = 0;
+};
+
+std::shared_ptr<Event> Event::Adopt(const std::shared_ptr<ModuleLink::State>& link, uint32_t handle) {
+    auto mirror = std::make_shared<EventMirror>();
+    // The kernel keeps this callback, and with it the mirror, until Unwatch.
+    mirror->watch = link->kernel.WatchEvent(link->process, handle, [mirror](bool signaled) {
+        std::function<void(bool)> notify;
+        {
+            std::lock_guard guard(mirror->lock);
+            mirror->signaled = signaled;
+            notify = mirror->on_change;
+        }
+        mirror->changed.notify_all();
+        if (notify)
+            notify(signaled);
+    });
+    if (!mirror->watch)
+        return nullptr;
+    return std::make_shared<Event>(link, handle, std::move(mirror));
+}
+
+Event::Event(std::shared_ptr<ModuleLink::State> link, uint32_t handle, std::shared_ptr<EventMirror> mirror)
+    : link_(std::move(link)), handle_(handle), mirror_(std::move(mirror)) {}
+
+Event::~Event() {
+    link_->kernel.Unwatch(mirror_->watch);
+    std::lock_guard guard(link_->lock);
+    svc::CloseHandle(link_->thread, handle_);
+}
+
+bool Event::Signaled() const {
+    std::lock_guard guard(mirror_->lock);
+    return mirror_->signaled;
+}
+
+bool Event::Wait(std::chrono::nanoseconds timeout) {
+    std::unique_lock guard(mirror_->lock);
+    const auto signaled = [&] { return mirror_->signaled; };
+    if (timeout.count() < 0) {
+        mirror_->changed.wait(guard, signaled);
+        return true;
+    }
+    return mirror_->changed.wait_for(guard, timeout, signaled);
+}
+
+void Event::Clear() {
+    std::lock_guard guard(link_->lock);
+    svc::ClearEvent(link_->thread, handle_);
+}
+
+void Event::Watch(std::function<void(bool)> on_change) {
+    std::lock_guard guard(mirror_->lock);
+    mirror_->on_change = std::move(on_change);
 }
 
 } // namespace client

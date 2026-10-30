@@ -7,7 +7,7 @@ vector registers, branch outcome and every changed scratch byte must match.
 States where unicorn faults (a random address outside the mapped memory) are
 dropped before the C++ side runs them.
 
-Usage: python tools/difftest.py <module.elf> <workdir> [--states N] [--limit N]
+Usage: python tools/difftest.py <module.elf> <workdir> [--states N] [--limit N] [--simd | --integer]
 """
 import argparse
 import random
@@ -26,10 +26,41 @@ import lift  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = 0x10000000
 SCRATCH_SIZE = 0x10000
+# One CLREX, run before each case: unicorn keeps its exclusive monitor across
+# runs, and the lifted side starts every case with it clear.
+CLREX_PAGE = 0x20000000
+CLREX = 0xD503305F
 STATE = struct.Struct("<31QQQ64QQQ")
 XREGS = [getattr(A, f"UC_ARM64_REG_X{i}") for i in range(31)]
 QREGS = [getattr(A, f"UC_ARM64_REG_Q{i}") for i in range(32)]
 NICE_DOUBLES = [0.0, -0.0, 1.0, -1.5, 2.5, 100.0, 1e10, -3e-5, 0.5, 4294967296.0, -9.2e18, float("inf")]
+# Single-precision bit patterns: ordinary values, +-0, +-inf, quiet and
+# signalling NaNs with payloads, the smallest and largest subnormal, the
+# largest finite, and values around the integer conversion limits.
+NICE_FLOATS = [0x00000000, 0x80000000, 0x3F800000, 0xBFC00000, 0x40200000, 0x42C80000, 0x501502F9, 0xB7FBA882,
+               0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC12345, 0x7F800001, 0x7FA00042, 0x00000001, 0x007FFFFF,
+               0x7F7FFFFF, 0x4F000000, 0xCF000000, 0x4F800000, 0x5F000000, 0x3EAAAAAB, 0x3F7FFFFF, 0x00800000]
+# Double-precision patterns that random doubles rarely hit.
+NICE_DOUBLE_BITS = [0x7FF8000000000000, 0xFFF0000000000001, 0x7FF4000000000042, 0x0000000000000001,
+                    0x000FFFFFFFFFFFFF, 0x7FEFFFFFFFFFFFFF, 0x0010000000000000, 0x43E0000000000000]
+
+
+def random_vector(rng):
+    r = rng.random()
+    if r < 0.3:
+        lanes = [rng.choice(NICE_FLOATS) if rng.random() < 0.7 else
+                 struct.unpack("<I", struct.pack("<f", rng.choice(NICE_DOUBLES[:-1]) * rng.choice([1, 3, -7])))[0]
+                 for _ in range(4)]
+        return lanes[0] | lanes[1] << 32, lanes[2] | lanes[3] << 32
+    if r < 0.55:
+        halves = []
+        for _ in range(2):
+            if rng.random() < 0.3:
+                halves.append(rng.choice(NICE_DOUBLE_BITS))
+            else:
+                halves.append(struct.unpack("<Q", struct.pack("<d", rng.choice(NICE_DOUBLES) * rng.choice([1, 3, -7])))[0])
+        return halves[0], halves[1]
+    return rng.getrandbits(64), rng.getrandbits(64)
 
 
 def random_state(rng, w):
@@ -46,11 +77,8 @@ def random_state(rng, w):
     nzcv = rng.randrange(16) << 28
     q = []
     for _ in range(32):
-        if rng.random() < 0.5:
-            lo = struct.unpack("<Q", struct.pack("<d", rng.choice(NICE_DOUBLES) * rng.choice([1, 3, -7])))[0]
-        else:
-            lo = rng.getrandbits(64)
-        q += [lo, rng.getrandbits(64)]
+        lo, hi = random_vector(rng)
+        q += [lo, hi]
     if lift.bits(w, 28, 25) & 0b0101 == 0b0100 and rng.random() < 0.5:
         # A load or store: put the base near the bottom of scratch so large
         # positive offsets stay inside it, and keep a register index small.
@@ -77,6 +105,7 @@ def unicorn_run(uc, pc, state, scratch, writes):
         uc.reg_write(QREGS[i], q[2 * i] | q[2 * i + 1] << 64)
     uc.reg_write(A.UC_ARM64_REG_TPIDR_EL0, state[97])
     uc.reg_write(A.UC_ARM64_REG_TPIDRRO_EL0, state[98])
+    uc.emu_start(CLREX_PAGE, CLREX_PAGE + 4, count=1)
     writes.clear()
     uc.emu_start(pc, pc + 0x1000, count=1)
     out = [uc.reg_read(r) for r in XREGS]
@@ -106,12 +135,17 @@ def unicorn_run(uc, pc, state, scratch, writes):
     return out, taken, changed
 
 
-def select_words(lifter, limit):
+def is_simd(w):
+    """Floating point and Advanced SIMD, including their loads and stores."""
+    return lift.bits(w, 28, 25) & 0b0111 == 0b0111 or lift.bits(w, 28, 25) & 0b0101 == 0b0100 and lift.bits(w, 26, 26)
+
+
+def select_words(lifter, limit, simd_only=False, integer_only=False):
     img = lifter.image
     chosen = {}
     for pc in range(img.text_base, img.text_end, 4):
         w = img.word(pc)
-        if w in chosen:
+        if w in chosen or (simd_only and not is_simd(w)) or (integer_only and is_simd(w)):
             continue
         i = lifter.decoder.decode(pc, w)
         if i.kind == "op":
@@ -159,13 +193,16 @@ def main():
     ap.add_argument("--states", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1)
+    kind = ap.add_mutually_exclusive_group()
+    kind.add_argument("--simd", action="store_true", help="only floating-point and SIMD instructions")
+    kind.add_argument("--integer", action="store_true", help="only the others")
     args = ap.parse_args()
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
 
     image = lift.Image(args.elf)
     lifter = lift.Lifter(image)
-    items = select_words(lifter, args.limit)
+    items = select_words(lifter, args.limit, args.simd, args.integer)
     print(f"{len(items)} distinct instruction words")
 
     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
@@ -175,6 +212,8 @@ def main():
         uc.mem_map(lo, hi - lo)
         uc.mem_write(va, blob)
     uc.mem_map(SCRATCH, SCRATCH_SIZE)
+    uc.mem_map(CLREX_PAGE, 0x1000)
+    uc.mem_write(CLREX_PAGE, struct.pack("<I", CLREX))
     rng = random.Random(args.seed)
     scratch = bytearray(rng.getrandbits(8) for _ in range(SCRATCH_SIZE))
     uc.mem_write(SCRATCH, bytes(scratch))
@@ -184,6 +223,11 @@ def main():
     started = time.time()
     cases, expected = [], []
     for n, (w, (pc, i)) in enumerate(items):
+        # Every word runs at its own address, so unicorn translates a new
+        # block each time; past about 240,000 its translation buffer
+        # overflows and it crashes. Start afresh now and then.
+        if n % 20000 == 0:
+            uc.ctl_flush_tb()
         for _ in range(args.states):
             state = random_state(rng, w)
             try:

@@ -23,6 +23,7 @@ private:
     std::thread thread_;
     std::atomic<void*> native_{};
     std::atomic<bool> done_{};
+    std::atomic<bool> cancel_{}; // POSIX: an interrupted read or write gives up
 };
 
 } // namespace hk::platform

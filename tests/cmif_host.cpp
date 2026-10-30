@@ -2,6 +2,8 @@
 // cmif_host --link <read> <write>. Port "test" answers
 //   0 Echo(raw) -> raw            1 OpenSub() -> the same interface, moved
 //   2 WhoAmI(pid) -> pid          3 Crash(): the host process ends at once
+//   4 GetEvent() -> the interface's event, copied
+//   5 Signal()                    6 Clear(): of that event
 // Runs until its parent kills it.
 #include "hk/link.h"
 #include "services/native.h"
@@ -11,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <tuple>
 
 namespace {
 
@@ -30,10 +33,24 @@ public:
             return 0;
         case 3:
             std::_Exit(9);
+        case 4:
+            if (!writable_)
+                std::tie(writable_, readable_) = request.create_event_pair();
+            response.copy.push_back(readable_);
+            return 0;
+        case 5:
+        case 6:
+            if (!writable_)
+                return services::MakeResult(10, 221);
+            (request.command == 5 ? request.signal_event : request.clear_event)(writable_);
+            return 0;
         default:
             return services::MakeResult(10, 221);
         }
     }
+
+private:
+    uint32_t writable_ = 0, readable_ = 0;
 };
 
 } // namespace

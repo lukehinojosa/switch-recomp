@@ -7,7 +7,8 @@ recompiled `pctl` starts in both maintenance and normal boot, registers its
 four ports and answers requests. The
 first host title is MK8D through the mk8-recomp runtime; this repository holds the
 sysmodule work itself. This work is now phase 0 of the project
-[plan](../plan.md), which carries milestones 4 and 5 into its roadmap.
+[plan](../plan.md), which carries milestones 4 and 5 into its roadmap;
+milestone 5's events and round-trip cost are done (phase 1).
 
 ## Goal
 
@@ -594,8 +595,42 @@ change".
      SDK, including a command MK8D never sends. The fifth, 1432, returns an
      event as a copied handle, which the link does not carry (the client
      closes copied handles), so it moves to milestone 5.
-4. Substitution reaches the same reviewed frames as the default path.
+4. Substitution reaches the same reviewed frames as the default path. (Moved
+   to the [plan](../plan.md)'s test harness.)
 5. Measure round-trip cost, then decide between `aoc:u` (events) and `fs`
    (buffers) as the next target. Events include pctl's 1432 left over from
    milestone 3: carrying copied handles over the link, so that the title
    receives the module's event and can wait on it.
+   - **Done: events across the link.** A readable event copied or moved
+     across the link becomes a mirror in the other kernel: the owner sends
+     every change of its signal state, a mirror's clears go back to the
+     owner, and a generation count lets a signal that overtakes a clear
+     stand. `Kernel::WatchEvent` tells host code about changes (for a title
+     passing them to its own kernel's event), and `module_client` returns
+     events as `client::Event` (C: `hk_module_event`). `transport_test` and
+     `client_c_test` cover signal, clear in both directions, waiting and
+     watching; 200 repeated runs passed.
+   - **Done: 1432 in the shadow, and a real difference.** In firmware
+     23.0.1 the method behind `GetSynchronizationEvent` (`0x710002ed50`)
+     first requires capability `0x8`, which sessions on the application port
+     `pctl` do not have (they carry `0x303`, enough for 1031, 1062 and
+     1065), and returns `0x10A8E`; with the capability it then requires an
+     object the module creates only during normal start-up, and returns
+     `0x10E8E` in maintenance mode. mk8-recomp's verified service checks
+     neither and returns an event. The shadow now includes 1432 on both pctl
+     children and reports the difference; which reply the game should get is
+     a question for mk8-recomp's verified service, not for the link. On
+     `pctl:s`, whose sessions have the capability, the normal-boot module
+     answers 1432 with its event, and the client receives it across the link
+     as an unsignalled mirror: the end-to-end case with real firmware.
+   - **Done: round-trip cost** (`roundtrip_bench`, Release, Windows, idle
+     machine). A request to the echo server in the same kernel takes a 2 µs
+     median (p99 12 to 16 µs); across the link 35 µs (p99 80 µs); a real
+     recompiled `pctl` command (1031) across the link 43.5 µs (p99 96 to
+     110 µs). That is fine for `pctl` and other services a game calls at
+     start-up or in menus, and too slow for anything called many times per
+     frame: a hundred such calls would take a quarter of a 60 Hz frame. So
+     the services a game calls per frame (`nvdrv`, `hid`, `audio`, `vi`,
+     `fs` during loads) run in the host process, native or as recompiled
+     modules in the in-process mode, as the plan already has it. The next
+     sysmodule target is chosen in the plan's phase 2.

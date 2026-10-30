@@ -2,17 +2,11 @@
 // drives its "test" port through CMIF requests, sub-interfaces, the PID
 // descriptor, a missing port and the child crashing.
 #include "client/module_link.h"
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "linked_child.h"
 
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 namespace {
 
@@ -28,15 +22,9 @@ int failures = 0;
 
 constexpr uint64_t kPid = 0x1234567890;
 
-std::filesystem::path HostPath() {
-    wchar_t path[MAX_PATH];
-    const DWORD size = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    return std::filesystem::path(std::wstring(path, size)).parent_path() / L"cmif_host.exe";
-}
-
 std::shared_ptr<client::ModuleLink> Start() {
     client::ModuleOptions options;
-    options.executable = HostPath();
+    options.executable = testing::Beside("cmif_host");
     options.process_id = kPid;
     return client::ModuleLink::Start(options);
 }
@@ -82,7 +70,7 @@ void ChildCrash() {
     const auto crashed = session->Request(3, {}, false);
     CHECK(crashed.kernel != 0);
     for (int i = 0; i < 500 && link->Running(); ++i)
-        Sleep(10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK(!link->Running());
     CHECK(session->Request(0, {}, false).kernel != 0);
     CHECK(link->Connect("test", std::chrono::milliseconds(50)) == nullptr);

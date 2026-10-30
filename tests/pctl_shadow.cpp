@@ -10,17 +10,19 @@
 // capabilities 0x303; pctl:s, pctl:a and pctl:r are opened with none there,
 // although firmware gives them their own (MK8D never calls methods on them).
 // A comparison passes when the results match and, on success, the verified
-// output bytes and moved-object count match. Exit code: the number of
+// output bytes, moved-object count and copied events (with their signal
+// state) match. The verified service creates 1432's event unsignalled and
+// never signals it. Exit code: the number of
 // differences, or 100 if the module could not be reached.
 #include "client/module_link.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
+#include <process.h>
+#include <stdlib.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 
 #include <cstdio>
 #include <cstring>
@@ -36,6 +38,7 @@ struct Expected {
     uint32_t result = 0;
     std::vector<uint8_t> output; // compared on success
     size_t objects = 0;
+    size_t events = 0; // copied, unsignalled
 };
 
 int differences = 0;
@@ -55,10 +58,17 @@ void Compare(const char* label, const client::Reply& reply, const Expected& expe
     bool same = reply.result == expected.result;
     if (same && expected.result == 0) {
         same = reply.objects.size() == expected.objects && reply.raw.size() >= expected.output.size() &&
-               std::memcmp(reply.raw.data(), expected.output.data(), expected.output.size()) == 0;
+               std::memcmp(reply.raw.data(), expected.output.data(), expected.output.size()) == 0 &&
+               reply.events.size() == expected.events;
+        for (const auto& event : reply.events)
+            same = same && !event->Signaled();
     }
-    std::printf("%s %-44s result %08x (verified %08x), objects %zu (%zu), output %s\n", same ? "same" : "DIFF", label,
-                reply.result, expected.result, reply.objects.size(), expected.objects, output.empty() ? "-" : output.c_str());
+    std::string events; // S: signalled
+    for (const auto& event : reply.events)
+        events += event->Signaled() ? "S" : "-";
+    std::printf("%s %-44s result %08x (verified %08x), objects %zu (%zu), events %s (%zu), output %s\n",
+                same ? "same" : "DIFF", label, reply.result, expected.result, reply.objects.size(), expected.objects,
+                events.empty() ? "none" : events.c_str(), expected.events, output.empty() ? "-" : output.c_str());
     if (!same)
         ++differences;
 }
@@ -70,6 +80,7 @@ void ChildCalls(const std::string& prefix, client::Session& child) {
     Compare((prefix + " 1031 IsRestrictionEnabled").c_str(), child.Request(1031, {}, false), {0, {0}, 0});
     Compare((prefix + " 1062 GetStereoVisionRestriction").c_str(), child.Request(1062, {}, false), {0, {0}, 0});
     Compare((prefix + " 1065 IsStereoVisionPermitted").c_str(), child.Request(1065, {}, false), {0, {1}, 0});
+    Compare((prefix + " 1432 GetSynchronizationEvent").c_str(), child.Request(1432, {}, false), {0, {}, 0, 1});
 }
 
 } // namespace
@@ -79,7 +90,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: pctl_shadow <module_host.exe> <pctl.load.elf> <control.nacp> [boot mode]\n");
         return 2;
     }
-    const uint64_t pid = GetCurrentProcessId();
+    const uint64_t pid = static_cast<uint64_t>(getpid());
     client::ModuleOptions options;
     options.executable = argv[1];
     options.process_id = pid;
@@ -89,7 +100,11 @@ int main(int argc, char** argv) {
     std::snprintf(program, sizeof program, "%016llx", static_cast<unsigned long long>(kMk8dProgram));
     options.arguments = {"--application", std::to_string(pid), program, version, argv[3], argv[2]};
     if (argc > 4)
-        SetEnvironmentVariableA("RT_BOOT_MODE", argv[4]);
+#ifdef _WIN32
+        _putenv_s("RT_BOOT_MODE", argv[4]); // inherited by the module host
+#else
+        setenv("RT_BOOT_MODE", argv[4], 1);
+#endif
     std::shared_ptr<client::ModuleLink> link;
     try {
         link = client::ModuleLink::Start(options);
@@ -134,6 +149,18 @@ int main(int argc, char** argv) {
         if (opened.objects.size() == 1)
             Compare((name + " child 1 Initialize").c_str(), opened.objects[0]->Request(1, {}, false), {kNoCapability, {}, 0});
         Compare((name + " 0 CreateService").c_str(), restricted->Request(0, kCreateInput, true), {kNoCapability, {}, 0});
+    }
+    // Not a comparison: the module's event from 1432 on a port whose sessions
+    // have capability 0x8, which firmware requires for it and "pctl" lacks.
+    // Only in normal boot (mode 0): in maintenance mode the module refuses it.
+    if (auto system = link->Connect("pctl:s", std::chrono::seconds(5))) {
+        auto opened = system->Request(1, kCreateInput, true);
+        if (opened.objects.size() == 1 && opened.objects[0]->Request(1, {}, false).result == 0) {
+            auto sync = opened.objects[0]->Request(1432, {}, false);
+            std::printf("info pctl:s child 1432 (module only): result %08x, %zu event(s)%s\n", sync.result,
+                        sync.events.size(),
+                        sync.events.empty() ? "" : sync.events[0]->Signaled() ? ", signalled" : ", not signalled");
+        }
     }
     std::printf("%d difference(s)\n", differences);
     return differences;

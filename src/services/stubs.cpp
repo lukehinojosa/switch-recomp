@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -357,6 +358,12 @@ public:
         case 101: // IsStandardNetworkSystemClockAccuracySufficient -> bool
             response.Out(uint8_t{1});
             return 0;
+        case 300: // CalculateMonotonicSystemClockBaseTimePoint(context) -> i64
+            // The context's offset plus the steady clock's now, less the
+            // tick counter's seconds: the two count from the same moment
+            // here, so the offset alone.
+            response.Out(request.In<int64_t>(0));
+            return 0;
         default:
             return kUnknown;
         }
@@ -660,19 +667,80 @@ private:
     std::shared_ptr<MemoryFileSystem> fs_;
 };
 
-// System saves, shared by every fsp-srv session of the host.
+// The application's RomFS: an image on the host, read where the title asks.
+class RomStorage final : public Interface {
+public:
+    explicit RomStorage(std::shared_ptr<std::ifstream> file) : file_(std::move(file)) {}
+    const char* Name() const override { return "fs IStorage (RomFS)"; }
+    hk::Result Handle(const Request& request, Response& response) override {
+        switch (request.command) {
+        case 0: { // Read(offset, size) -> B
+            const auto offset = request.In<int64_t>(0), size = request.In<int64_t>(8);
+            if (offset < 0 || size < 0)
+                return kOutOfRange;
+            std::vector<std::byte> bytes(static_cast<size_t>(size));
+            file_->clear();
+            file_->seekg(offset);
+            if (!file_->read(reinterpret_cast<char*>(bytes.data()), size) || !request.OutBuffer(bytes))
+                return kOutOfRange;
+            return 0;
+        }
+        case 4: // GetSize -> s64
+            file_->clear();
+            file_->seekg(0, std::ios::end);
+            response.Out(static_cast<int64_t>(file_->tellg()));
+            return 0;
+        default:
+            return kUnknown;
+        }
+    }
+
+private:
+    std::shared_ptr<std::ifstream> file_;
+};
+
+// Saves, shared by every fsp-srv session of the host: system saves by id,
+// the application's by their whole attribute.
 struct SaveStore {
     std::map<uint64_t, std::shared_ptr<MemoryFileSystem>> saves;
+    std::map<std::array<std::byte, 0x40>, std::shared_ptr<MemoryFileSystem>> application_saves;
 };
 
 // fsp-srv: IFileSystemProxy. Commands are added as modules are seen to use them.
 class FileSystemProxy final : public Interface {
 public:
-    FileSystemProxy(std::shared_ptr<SaveStore> store, bool trace) : store_(std::move(store)), trace_(trace) {}
+    FileSystemProxy(std::shared_ptr<SaveStore> store, std::shared_ptr<std::ifstream> romfs, bool trace)
+        : store_(std::move(store)), romfs_(std::move(romfs)), trace_(trace) {}
     const char* Name() const override { return "fsp-srv"; }
     hk::Result Handle(const Request& request, Response& response) override {
         switch (request.command) {
         case 1: // SetCurrentProcess(pid)
+        case 1003: // DisableAutoSaveDataCreation
+        case 1004: // SetGlobalAccessLogMode(mode)
+        case 1006: // OutputAccessLogToSdCard(A)
+            return 0;
+        case 1005: // GetGlobalAccessLogMode -> u32: no access log
+            response.Out(uint32_t{0});
+            return 0;
+        case 1011: // GetProgramIndexForAccessLog -> u32 index, u32 count
+            response.Out(std::array<uint32_t, 2>{0, 1});
+            return 0;
+        case 51: { // OpenSaveDataFileSystem(space, attribute) -> IFileSystem
+            // A title's own saves start empty and are made when first opened,
+            // as am's EnsureSaveData would have made them.
+            std::array<std::byte, 0x40> attribute;
+            std::memcpy(attribute.data(), request.raw.data() + 8, std::min<size_t>(0x40, request.raw.size() - 8));
+            auto& save = store_->application_saves[attribute];
+            if (!save)
+                save = std::make_shared<MemoryFileSystem>();
+            Trace("opened application", request.In<uint64_t>(8));
+            response.objects.push_back(std::make_shared<FileSystem>(save));
+            return 0;
+        }
+        case 200: // OpenDataStorageByCurrentProcess -> IStorage
+            if (!romfs_)
+                return kTargetNotFound;
+            response.objects.push_back(std::make_shared<RomStorage>(romfs_));
             return 0;
         case 23: { // CreateSaveDataFileSystemBySystemSaveDataId(attribute, creation info)
             const uint64_t id = request.In<uint64_t>(0x18);
@@ -728,6 +796,7 @@ private:
             std::fprintf(stderr, "fsp-srv: %s save %016llx\n", what, static_cast<unsigned long long>(id));
     }
     std::shared_ptr<SaveStore> store_;
+    std::shared_ptr<std::ifstream> romfs_;
     bool trace_;
 };
 
@@ -735,9 +804,16 @@ private:
 
 void AddStubs(NativeHost& host, const StubOptions& options) {
     host.Add("lm", 42, [] { return std::make_shared<LogService>(); });
-    host.Add("fsp-srv", 32, [store = std::make_shared<SaveStore>(), trace = options.trace] {
-        return std::make_shared<FileSystemProxy>(store, trace);
-    });
+    std::shared_ptr<std::ifstream> romfs;
+    if (!options.romfs.empty()) {
+        romfs = std::make_shared<std::ifstream>(options.romfs, std::ios::binary);
+        if (!*romfs) {
+            std::fprintf(stderr, "fsp-srv: could not open %s\n", options.romfs.c_str());
+            romfs.reset();
+        }
+    }
+    host.Add("fsp-srv", 32, [store = std::make_shared<SaveStore>(), romfs,
+                             trace = options.trace] { return std::make_shared<FileSystemProxy>(store, romfs, trace); });
     host.Add("set:sys", 32, [] { return std::make_shared<SystemSettings>(); });
     host.Add("ssl:s", 8, [] { return std::make_shared<SslService>(); });
     host.Add("psc:m", 16, [] { return std::make_shared<PowerService>(); });
