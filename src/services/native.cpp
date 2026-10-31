@@ -30,6 +30,10 @@ constexpr uint32_t kOutMagic = 0x4F434653; // "SFCO"
 const hk::Result kUnknownCommand = MakeResult(10, 221);
 
 enum MessageType : uint32_t { Close = 2, Request4 = 4, Control = 5, RequestWithContext = 6, ControlWithContext = 7 };
+// TIPC, which some services speak since 12.0.0: the message type is the
+// command plus 16 and the data words are the arguments, with no header; type
+// 15 closes. A reply keeps the request's type and starts with the result.
+constexpr uint32_t kTipcClose = 15, kTipcFirst = 16;
 
 uint32_t Padding(const Message& m) { return CmifPadding(m); }
 
@@ -131,12 +135,15 @@ struct NativeHost::State {
             }
             const uint32_t session = handles[index];
             const Message message = ReadMessage(memory, kTls);
-            if (message.type == Close) {
+            if (message.type == Close || message.type == kTipcClose) {
                 Drop(index);
                 continue;
             }
             Message reply;
-            Serve(session, message, reply);
+            if (message.type >= kTipcFirst)
+                ServeTipc(session, message, reply);
+            else
+                Serve(session, message, reply);
             WithReceiveList(reply);
             WriteMessage(memory, kTls, reply);
             reply_target = session;
@@ -149,6 +156,12 @@ struct NativeHost::State {
     }
 
     void Drop(uint32_t index) {
+        if (trace) {
+            auto it = sessions.find(handles[index]);
+            std::fprintf(stderr, "native: %s session %08x closed\n",
+                         it != sessions.end() && it->second.object ? it->second.object->Name() : "a",
+                         handles[index]);
+        }
         svc::CloseHandle(thread, handles[index]);
         sessions.erase(handles[index]);
         handles.erase(handles.begin() + index);
@@ -198,59 +211,15 @@ struct NativeHost::State {
             result = kUnknownCommand;
         } else {
             request.command = data[at + 2];
-            request.pid = message.pid;
-            request.copy = message.copy;
-            request.move = message.move;
-            for (size_t i = at + 4; i < end; ++i) {
-                const uint32_t word = data[i];
-                const auto* bytes = reinterpret_cast<const std::byte*>(&word);
-                request.raw.insert(request.raw.end(), bytes, bytes + 4);
-            }
-            for (const auto& x : message.statics)
-                request.statics.push_back({x.address, x.size});
-            for (const auto& b : message.sends)
-                request.sends.push_back({b.address, b.size});
-            for (const auto& b : message.receives)
-                request.receives.push_back({b.address, b.size});
-            for (const auto& b : message.exchanges)
-                request.exchanges.push_back({b.address, b.size});
-            request.read = [this](uint64_t a, std::span<std::byte> out) { return memory.Read(a, out); };
-            request.write = [this](uint64_t a, std::span<const std::byte> in) { return memory.Write(a, in); };
-            request.create_event = [this] {
-                uint32_t writable = 0, readable = 0;
-                svc::CreateEvent(thread, writable, readable);
-                return readable;
-            };
-            request.create_event_pair = [this] {
-                uint32_t writable = 0, readable = 0;
-                svc::CreateEvent(thread, writable, readable);
-                return std::pair{writable, readable};
-            };
-            request.signal_event = [this](uint32_t writable) { svc::SignalEvent(thread, writable); };
-            request.transfer_memory = [this](uint32_t handle, hk::Kernel::TransferRange& out) {
-                return kernel.FindTransferMemory(process, handle, out);
-            };
-            request.clear_event = [this](uint32_t writable) { svc::ClearEvent(thread, writable); };
-            request.create_shared_memory = [this](std::vector<std::byte> contents) {
-                return kernel.CreateSharedMemory(process, std::move(contents));
-            };
-
+            Prepare(request, message, at + 4, end);
             if (control)
                 result = HandleControl(request, response, session);
             else if (type == Request4 || type == RequestWithContext)
                 result = object->Handle(request, response);
             else
                 result = kUnknownCommand;
-            if (trace || result == kUnknownCommand) {
-                std::string input;
-                for (size_t i = 0; i < request.raw.size() && i < 16; ++i) {
-                    char hex[4];
-                    std::snprintf(hex, sizeof hex, "%02x", static_cast<unsigned>(request.raw[i]));
-                    input += hex;
-                }
-                std::fprintf(stderr, "native: %s%s command %u (%zu bytes in: %s) -> %08x\n", object->Name(),
-                             control ? " control" : "", request.command, request.raw.size(), input.c_str(), result);
-            }
+            if (trace || result == kUnknownCommand)
+                Log(*object, control ? " control" : "", request, result);
         }
         if (!result) {
             // Output for C buffers goes back as X buffers; set before Finish,
@@ -266,6 +235,98 @@ struct NativeHost::State {
             }
         }
         Finish(reply, session, domain, result, std::move(response));
+    }
+
+    // Fills in a request's arguments (data words from to end), handles,
+    // buffers and the host's helpers.
+    void Prepare(Request& request, const Message& message, size_t from, size_t end) {
+        request.pid = message.pid;
+        request.copy = message.copy;
+        request.move = message.move;
+        for (size_t i = from; i < end; ++i) {
+            const uint32_t word = message.data[i];
+            const auto* bytes = reinterpret_cast<const std::byte*>(&word);
+            request.raw.insert(request.raw.end(), bytes, bytes + 4);
+        }
+        for (const auto& x : message.statics)
+            request.statics.push_back({x.address, x.size});
+        for (const auto& b : message.sends)
+            request.sends.push_back({b.address, b.size});
+        for (const auto& b : message.receives)
+            request.receives.push_back({b.address, b.size});
+        for (const auto& b : message.exchanges)
+            request.exchanges.push_back({b.address, b.size});
+        request.read = [this](uint64_t a, std::span<std::byte> out) { return memory.Read(a, out); };
+        request.write = [this](uint64_t a, std::span<const std::byte> in) { return memory.Write(a, in); };
+        request.create_event = [this] {
+            uint32_t writable = 0, readable = 0;
+            svc::CreateEvent(thread, writable, readable);
+            return readable;
+        };
+        request.create_event_pair = [this] {
+            uint32_t writable = 0, readable = 0;
+            svc::CreateEvent(thread, writable, readable);
+            return std::pair{writable, readable};
+        };
+        request.signal_event = [this](uint32_t writable) { svc::SignalEvent(thread, writable); };
+        request.transfer_memory = [this](uint32_t handle, hk::Kernel::TransferRange& out) {
+            return kernel.FindTransferMemory(process, handle, out);
+        };
+        request.clear_event = [this](uint32_t writable) { svc::ClearEvent(thread, writable); };
+        request.create_shared_memory = [this](std::vector<std::byte> contents) {
+            return kernel.CreateSharedMemory(process, std::move(contents));
+        };
+    }
+
+    void Log(const Interface& object, const char* kind, const Request& request, hk::Result result) {
+        std::string input;
+        for (size_t i = 0; i < request.raw.size() && i < 16; ++i) {
+            char hex[4];
+            std::snprintf(hex, sizeof hex, "%02x", static_cast<unsigned>(request.raw[i]));
+            input += hex;
+        }
+        std::fprintf(stderr, "native: %s%s command %u (%zu bytes in: %s) -> %08x\n", object.Name(), kind,
+                     request.command, request.raw.size(), input.c_str(), result);
+    }
+
+    // A TIPC request. Returned interfaces become moved sessions, which speak
+    // TIPC too; there are no domains, buffers come back only through B.
+    void ServeTipc(uint32_t handle, const Message& message, Message& reply) {
+        Session& session = sessions[handle];
+        Request request;
+        Response response;
+        request.command = message.type - kTipcFirst;
+        Prepare(request, message, 0, message.data.size());
+        hk::Result result = session.object->Handle(request, response);
+        if (trace || result == kUnknownCommand)
+            Log(*session.object, " (TIPC)", request, result);
+        reply.type = message.type;
+        if (!result) {
+            reply.copy = response.copy;
+            for (auto& sub : response.objects) {
+                uint32_t server, client;
+                if (handles.size() >= kMaxHandles ||
+                    svc::CreateSession(thread, server, client) != hk::result::Success) {
+                    result = MakeResult(10, 3); // out of sessions
+                    break;
+                }
+                handles.push_back(server);
+                sessions[server].object = sub;
+                reply.move.push_back(client);
+            }
+        }
+        if (result) {
+            reply.copy.clear();
+            reply.move.clear();
+            response.raw.clear();
+        }
+        reply.data = {result};
+        response.raw.resize((response.raw.size() + 3) & ~size_t{3});
+        for (size_t i = 0; i < response.raw.size(); i += 4) {
+            uint32_t word;
+            std::memcpy(&word, response.raw.data() + i, 4);
+            reply.data.push_back(word);
+        }
     }
 
     // Builds the reply: returned interfaces become domain object ids or moved
@@ -371,6 +432,19 @@ void NativeHost::Add(std::string name, uint32_t max_sessions, Factory factory) {
         }
     }
     state_->ports.push_back({std::move(name), max_sessions, std::move(factory)});
+}
+
+void NativeHost::Omit(const std::vector<std::string>& names) {
+    std::erase_if(state_->ports, [&](const State::Port& port) {
+        return std::find(names.begin(), names.end(), port.name) != names.end();
+    });
+}
+
+std::vector<std::string> NativeHost::Names() const {
+    std::vector<std::string> names;
+    for (const auto& port : state_->ports)
+        names.push_back(port.name);
+    return names;
 }
 
 void NativeHost::Start() {

@@ -1,6 +1,6 @@
 # switch-recomp plan
 
-Status: draft, 2026-10-30; phase 1 done, phase 2 next. This plan sets the direction for the whole
+Status: draft, 2026-10-30; phase 1 done, phase 2 started. This plan sets the direction for the whole
 project. The [sysmodule design draft](docs/recompiled-sysmodule-design.md)
 stays the detailed record of the first track (recompiled `pctl`), which is now
 phase 0 of the roadmap below.
@@ -221,9 +221,14 @@ Running a new game becomes one run that produces a report.
   - a clean shadow of MK8D's `pctl` calls in mk8-recomp, and SSBU in
     WindowSmash using the recompiled module online.
 - **Done in phase 1:** events across the link, the round-trip cost and the
-  decision it leads to, the game interface (version 1), and the Linux
-  platform layer with GCC (Clang waits for the toolchain in WSL).
-- **In progress:** the first game on the host (phase 1, milestone 4).
+  decision it leads to, the game interface (version 1), Mario Kart 8 Deluxe
+  on the host up to its first GPU submission, and the Linux platform layer
+  (GCC and Clang).
+- **In progress:** phase 2's system logic (milestone 3): `settings`,
+  `account` and `ns` recompiled and running beside the title, each in its
+  own host process, with native `ncm` and `lr`, and `es` beside them; MK8D
+  gets `acc:u0` from `ns`, whose rights check `es` refuses until the title
+  is launched through `ns` ([docs/system-processes.md](docs/system-processes.md)).
 - **Not started:** graphics, macOS and Android.
 - **Carried over from the design draft:** milestone 4 (reviewed frames)
   becomes part of the test harness; milestone 5's round-trip measurement and
@@ -335,6 +340,23 @@ lifter and serving a real game's requests from recompiled firmware.
 3. **System logic.** Bring up `ns`, `account`, `settings`, `time` and the rest
    as the game asks for them, recompiled. *Exit:* no hand-written stub left
    on the game's start-up path except hardware and network.
+   *Started first*, because MK8D's next service, `acc:u0`, is `ns`'s in
+   firmware 23.0.1. `settings`, `account` and `ns` run as children of the
+   title's host (`--sysmodule`); the parent's kernel relays between its
+   links, the services a module's NPDM hosts replace the stubs of the same
+   names, and the host schedules the console's cores (one thread at a time
+   per core, by priority), which `account` turned out to rely on. A native
+   `pgl` serves `ns` over TIPC, which `NativeHost` now speaks; native `ncm`
+   and `lr` serve an index of the firmware's and the user's content (part
+   of milestone 2's content and storage); fibers become host fibers. All
+   modules finish start-up and MK8D gets `acc:u0` from `ns`. `es` is
+   recompiled too (its key commands opaque, since the host has no console
+   keys and reads content itself); `ns`'s rights check reaches it and is
+   refused, because `ns` registers a title with `es` only when it launches
+   it, and the host launches MK8D itself. With `--launch` the host now does
+   `am`'s part through `ns:am2` (records, launch info, instance, `arp` native
+   in the root), and `ns`'s launch stops at its table of rights
+   environments, which the command that fills it is still to be found for.
 4. **In-process mode.** All modules in one host process. *Exit:* the same
    game runs in both modes with the same results.
 

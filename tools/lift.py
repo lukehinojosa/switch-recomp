@@ -1432,6 +1432,12 @@ class Lifter:
                 # A bl over a data word only takes the word's address in x30
                 # (rtld's position-independent idiom); it does not return here.
                 i = Insn("b", [f"c.x[30] = 0x{pc + 4:x}ull;"], target=pc + 8)
+            n = stack_switch(self.image, pc)
+            if n is not None:
+                # Another context's stack: the runtime switches host fibers,
+                # and a new context starts at the next instruction.
+                i = Insn("op", [f"{{ const u64 previous = c.sp; c.sp = c.x[{n}]; "
+                                f"rt::SwitchStack(c, previous, 0x{pc + 4:x}ull); }}"])
             self.cache[pc] = i
         return self.cache[pc]
 
@@ -1470,6 +1476,8 @@ class Lifter:
                             found.add(t)
                     if nxt & 31 == rd and not is_store(nxt):
                         break
+            elif stack_switch(img, pc) is not None:
+                found.add(pc + 4)  # where a new context starts
         found.update(img.dynamic_entries())
         found.update(img.exported_functions())
         for va, blob, _, flags in img.segments:
@@ -1669,6 +1677,33 @@ class Lifter:
 
 
 # Emission -----------------------------------------------------------------
+
+
+def stack_switch(img, pc):
+    """Whether pc is mov sp, xN switching to another context's stack, as
+    fibers do: xN loaded from memory just before (not from the frame, as an
+    sp saved around a variable-sized allocation is), and x30 then restored
+    from the new stack before the ret (longjmp loads x30 first, from its
+    buffer). Returns N or None."""
+    w = img.word(pc)
+    if w & 0xFFFFFC1F != 0x9100001F or not img.in_text(pc - 4):
+        return None
+    n = bits(w, 9, 5)
+    prev = img.word(pc - 4)
+    loads = prev & 0xFFC00000 == 0xF9400000 or prev & 0xFFE00C00 == 0xF8400000
+    if n == 31 or not loads or prev & 31 != n or bits(prev, 9, 5) in (29, 31):
+        return None
+    for k in range(1, 33):
+        if not img.in_text(pc + 4 * k):
+            return None
+        nxt = img.word(pc + 4 * k)
+        if nxt == 0xD65F03C0:  # ret
+            return None
+        pair = nxt & 0xFFC00000 in (0xA9400000, 0xA8C00000, 0xA9C00000)  # ldp x, x: offset, post, pre
+        single = nxt & 0xFFC00000 == 0xF9400000                          # ldr x, [xn, #imm]
+        if bits(nxt, 9, 5) == 31 and ((pair and 30 in (nxt & 31, bits(nxt, 14, 10))) or (single and nxt & 31 == 30)):
+            return n
+    return None
 
 
 def is_store(w):

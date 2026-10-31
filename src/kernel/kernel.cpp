@@ -37,8 +37,10 @@ struct Link;
 
 // An object crossing a link, named by an id the exporting side chose: a
 // session end, or a readable event with its signal state at that moment. A
-// process crosses as its id alone (in generation).
-enum DescriptorKind : uint32_t { ClientEnd = 1, ServerEnd = 2, EventEnd = 3, ProcessEnd = 4 };
+// process crosses as its id alone (in generation). A client end the peer
+// serves goes back as PeerClientEnd, named by the peer's own id, with
+// signaled set when it moves.
+enum DescriptorKind : uint32_t { ClientEnd = 1, ServerEnd = 2, EventEnd = 3, ProcessEnd = 4, PeerClientEnd = 5 };
 struct Descriptor {
     uint32_t kind{}, id{};
     uint32_t signaled{};
@@ -186,6 +188,16 @@ struct Link {
     std::map<uint32_t, std::shared_ptr<EventState>> mirrored_events;    // the peer's, from arrival to last close
     std::map<uint64_t, Waiter*> waiting;
     std::set<std::string> remote_ports;
+
+    // Connects and requests from another link that this kernel passed on over
+    // this one, by the tag used here: the answer goes back to from under its
+    // own tag.
+    struct Relay {
+        Link* from{};
+        uint64_t tag{};
+        bool connect{};
+    };
+    std::map<uint64_t, Relay> relayed;
     bool broken = false;
 
     // Frames to write; guarded by queue_mutex, drained by the writer thread.
@@ -697,13 +709,14 @@ struct Kernel::Impl {
         return state;
     }
 
-    // Whether every object in a collected message can cross this link.
-    Result CheckExport(const Envelope& envelope) {
+    // Whether every object in a collected message can cross this link. A
+    // session or event from across another link crosses too: this kernel
+    // relays between the two.
+    Result CheckExport(const Envelope& envelope, const Link& link) {
         for (size_t i = 0; i < envelope.objects.size(); ++i) {
             const bool move = i >= envelope.layout.copy_count;
-            if (auto* client = dynamic_cast<ClientSession*>(envelope.objects[i].get())) {
-                if (client->state->server_link)
-                    return result::NotImplemented; // forwarding a session that is already remote
+            if (dynamic_cast<ClientSession*>(envelope.objects[i].get())) {
+                // crosses as it is, or back to the kernel that serves it
             } else if (auto* server = dynamic_cast<ServerSession*>(envelope.objects[i].get())) {
                 const auto& state = *server->state;
                 if (!move || state.server_link)
@@ -711,8 +724,10 @@ struct Kernel::Impl {
                 if (!state.pending.empty() || state.current || HasRemoteClients(state))
                     return result::InvalidState;
             } else if (auto* event = dynamic_cast<ReadableEvent*>(envelope.objects[i].get())) {
-                if (event->state->owner_link)
-                    return result::NotImplemented; // forwarding a mirror
+                if (event->state->owner_link == &link)
+                    return result::NotImplemented; // a mirror back to its owner
+            } else if (dynamic_cast<ProcessObject*>(envelope.objects[i].get())) {
+                // crosses as its id
             } else {
                 return result::NotImplemented; // ports and other objects stay local
             }
@@ -737,7 +752,15 @@ struct Kernel::Impl {
         for (size_t i = 0; i < envelope.objects.size(); ++i) {
             const bool move = i >= envelope.layout.copy_count;
             const uint32_t id = link.AllocateId();
-            if (auto client = std::dynamic_pointer_cast<ClientSession>(envelope.objects[i])) {
+            auto peer = std::dynamic_pointer_cast<ClientSession>(envelope.objects[i]);
+            if (peer && peer->state->server_link == &link) {
+                // The peer's own session: it hands out the client end it
+                // holds for us. A moved one is ours no more, and its
+                // reference passes to the peer with no close sent.
+                wire.descriptors.push_back({PeerClientEnd, peer->state->server_id, move});
+                if (move)
+                    link.outbound.erase(peer->state->server_id);
+            } else if (auto client = std::dynamic_pointer_cast<ClientSession>(envelope.objects[i])) {
                 if (!move)
                     ++client->handle_refs; // a moved handle's reference passes to the link
                 link.inbound[id] = std::move(client);
@@ -765,6 +788,17 @@ struct Kernel::Impl {
     }
 
     std::shared_ptr<Object> Import(Link& link, Descriptor descriptor) {
+        if (descriptor.kind == PeerClientEnd) {
+            auto it = link.inbound.find(descriptor.id);
+            if (it == link.inbound.end())
+                return nullptr;
+            std::shared_ptr<ClientSession> client = it->second;
+            if (descriptor.signaled) { // moved: the link's reference goes with it
+                link.inbound.erase(it);
+                --client->handle_refs;
+            }
+            return client;
+        }
         if (descriptor.kind == ClientEnd) {
             auto state = NewState();
             state->server_link = &link;
@@ -858,14 +892,53 @@ struct Kernel::Impl {
         std::erase_if(remote_requests, [&](const auto& owned) { return owned.get() == request; });
     }
 
+    // ---- Relays between links ----
+
+    // A link other than except that reaches the named port.
+    Link* RouteTo(const std::string& name, const Link* except) {
+        for (auto& link : links)
+            if (link.get() != except && !link->broken && link->remote_ports.contains(name))
+                return link.get();
+        return nullptr;
+    }
+
+    // Passes a message that arrived on from on to the link to: what it
+    // carries is imported here and exported again, so the sessions and events
+    // in it reach their owners through this kernel. Writebacks pass as they
+    // are, since they name the original client's buffers.
+    Result Forward(Link& from, const Wire& in, Link& to, Wire& out) {
+        Envelope envelope;
+        if (const Result r = FromWire(from, in, envelope))
+            return r;
+        if (const Result r = CheckExport(envelope, to)) {
+            for (const auto& object : envelope.objects)
+                Release(object);
+            return r;
+        }
+        // A moved object needs the reference a handle would have given it,
+        // which passes to the link; Export adds one for copied objects.
+        for (size_t i = envelope.layout.copy_count; i < envelope.objects.size(); ++i)
+            envelope.objects[i]->handle_refs = 1;
+        out = Export(to, envelope);
+        for (const auto& buffer : in.buffers)
+            if (buffer.kind == BufferWriteback)
+                out.buffers.push_back(buffer);
+        return result::Success;
+    }
+
     // ---- Closing ----
 
-    void CloseServer(SessionState& state) {
-        state.server_open = false;
+    // Tells the clients across links that a session's server end is gone.
+    void TellServerClosed(const SessionState& state) {
         for (auto& link : links)
             for (const auto& [id, client] : link->inbound)
                 if (client->state.get() == &state)
                     Send(*link, FrameWriter(Frame::ServerClosed).U32(id).Finish());
+    }
+
+    void CloseServer(SessionState& state) {
+        state.server_open = false;
+        TellServerClosed(state);
         if (state.current && state.current->link) {
             ReplyToRemote(state.current, result::SessionClosed);
             state.current = nullptr;
@@ -953,16 +1026,47 @@ struct Kernel::Impl {
         for (auto& [id, event] : exported)
             ReleaseExport(link, event, id);
         link.mirrored_events.clear(); // mirrors keep their last state
-        for (auto& [id, weak] : link.outbound)
-            if (auto state = weak.lock())
+        for (auto& [id, weak] : link.outbound) {
+            if (auto state = weak.lock()) {
                 state->server_open = false;
+                TellServerClosed(*state); // clients this kernel relays for
+            }
+        }
+        auto relayed = std::move(link.relayed);
+        link.relayed.clear();
+        for (const auto& [tag, relay] : relayed)
+            Send(*relay.from, relay.connect
+                                  ? FrameWriter(Frame::ConnectReply).U64(relay.tag).U32(result::NotFound).U32(0).Finish()
+                                  : FrameWriter(Frame::Reply).U64(relay.tag).U32(result::SessionClosed).Message({}).Finish());
         auto inbound = std::move(link.inbound);
         link.inbound.clear();
         for (auto& [id, client] : inbound)
             if (--client->handle_refs == 0)
                 client->LastHandleClosed();
+        auto names = std::move(link.remote_ports);
         link.remote_ports.clear();
+        for (const auto& name : names)
+            Unreachable(name, link);
         changed.notify_all();
+    }
+
+    // Passes a port's registration on to the other links, so that a kernel
+    // between two links makes each side's ports reachable from the other.
+    void PassPortOn(const std::string& name, const Link& from) {
+        for (auto& link : links)
+            if (link.get() != &from)
+                Send(*link, FrameWriter(Frame::PortRegistered).Text(name).Finish());
+    }
+
+    // A port that from no longer reaches: the other links hear of it once
+    // nothing here reaches it either.
+    void Unreachable(const std::string& name, const Link& from) {
+        auto it = ports.find(name);
+        if ((it != ports.end() && !it->second.expired()) || RouteTo(name, nullptr))
+            return;
+        for (auto& link : links)
+            if (link.get() != &from)
+                Send(*link, FrameWriter(Frame::PortUnregistered).Text(name).Finish());
     }
 
     // ---- Sessions shared by local and remote connects ----
@@ -992,10 +1096,12 @@ struct Kernel::Impl {
             const std::string name = in.Text();
             if (!in.Complete())
                 return false;
-            if (type == Frame::PortRegistered)
-                link.remote_ports.insert(name);
-            else
-                link.remote_ports.erase(name);
+            if (type == Frame::PortRegistered) {
+                if (link.remote_ports.insert(name).second)
+                    PassPortOn(name, link);
+            } else if (link.remote_ports.erase(name)) {
+                Unreachable(name, link);
+            }
             return true;
         }
         case Frame::Connect: {
@@ -1005,6 +1111,14 @@ struct Kernel::Impl {
                 return false;
             std::shared_ptr<ClientSession> client;
             const Result r = OpenSession(name, client);
+            if (r == result::NotFound) {
+                if (Link* next = RouteTo(name, &link)) {
+                    const uint64_t relay = next->next_tag++;
+                    next->relayed[relay] = {&link, tag, true};
+                    Send(*next, FrameWriter(Frame::Connect).U64(relay).Text(name).Finish());
+                    return true;
+                }
+            }
             uint32_t id = 0;
             if (r == result::Success) {
                 id = link.AllocateId();
@@ -1020,6 +1134,21 @@ struct Kernel::Impl {
             const uint32_t id = in.U32();
             if (!in.Complete())
                 return false;
+            if (auto relay = link.relayed.find(tag); relay != link.relayed.end()) {
+                const Link::Relay to = relay->second;
+                link.relayed.erase(relay);
+                uint32_t forwarded = 0;
+                if (r == result::Success && to.from->broken) {
+                    Send(link, FrameWriter(Frame::Close).U32(id).Finish());
+                } else if (r == result::Success) {
+                    auto client = Import(link, {ClientEnd, id});
+                    client->handle_refs = 1;
+                    forwarded = to.from->AllocateId();
+                    to.from->inbound[forwarded] = std::static_pointer_cast<ClientSession>(std::move(client));
+                }
+                Send(*to.from, FrameWriter(Frame::ConnectReply).U64(to.tag).U32(r).U32(forwarded).Finish());
+                return true;
+            }
             auto it = link.waiting.find(tag);
             if (it == link.waiting.end()) {
                 if (r == result::Success) // nobody wants the session any more
@@ -1046,6 +1175,20 @@ struct Kernel::Impl {
                 DropWire(link, wire);
                 return true;
             }
+            if (Link* next = it->second->state->server_link) { // a session this kernel relays
+                Wire out;
+                const Result r = next->broken ? result::SessionClosed : Forward(link, wire, *next, out);
+                if (r != result::Success) {
+                    if (next->broken)
+                        DropWire(link, wire);
+                    Send(link, FrameWriter(Frame::Reply).U64(tag).U32(r).Message({}).Finish());
+                    return true;
+                }
+                const uint64_t relay = next->next_tag++;
+                next->relayed[relay] = {&link, tag, false};
+                Send(*next, FrameWriter(Frame::Request).U32(it->second->state->server_id).U64(relay).Message(out).Finish());
+                return true;
+            }
             auto request = std::make_unique<Request>();
             request->link = &link;
             request->tag = tag;
@@ -1062,6 +1205,18 @@ struct Kernel::Impl {
             if (!in.Complete())
                 return false;
             AddMirrors(link, wire);
+            if (auto relay = link.relayed.find(tag); relay != link.relayed.end()) {
+                const Link::Relay to = relay->second;
+                link.relayed.erase(relay);
+                Wire out;
+                Result result = r;
+                if (to.from->broken || result != result::Success)
+                    DropWire(link, wire);
+                else
+                    result = Forward(link, wire, *to.from, out);
+                Send(*to.from, FrameWriter(Frame::Reply).U64(to.tag).U32(result).Message(out).Finish());
+                return true;
+            }
             auto it = link.waiting.find(tag);
             if (it == link.waiting.end()) {
                 DropWire(link, wire);
@@ -1092,9 +1247,12 @@ struct Kernel::Impl {
             if (!in.Complete())
                 return false;
             auto it = link.outbound.find(id);
-            if (it != link.outbound.end())
-                if (auto state = it->second.lock())
+            if (it != link.outbound.end()) {
+                if (auto state = it->second.lock()) {
                     state->server_open = false;
+                    TellServerClosed(*state);
+                }
+            }
             changed.notify_all();
             return true;
         }
@@ -1121,6 +1279,8 @@ struct Kernel::Impl {
             if (it == link.exported_events.end())
                 return true;
             auto& state = *it->second->state;
+            if (state.owner_link) // a mirror this kernel passed on: the owner decides
+                Send(*state.owner_link, FrameWriter(Frame::EventCleared).U32(state.owner_id).U64(generation).Finish());
             // A signal after the one the mirror saw stands.
             if (state.signaled && state.generation == generation) {
                 state.signaled = false;
@@ -1255,7 +1415,7 @@ struct Kernel::Impl {
         Envelope envelope;
         if (const Result e = Collect(*t.process, t.tls, envelope))
             return e;
-        if (const Result e = CheckExport(envelope))
+        if (const Result e = CheckExport(envelope, link))
             return e;
         CommitMoves(envelope);
         const Wire wire = Export(link, envelope);
@@ -1321,7 +1481,7 @@ struct Kernel::Impl {
             Envelope envelope;
             Result r = Collect(*t.process, t.tls, envelope);
             if (r == result::Success)
-                r = CheckExport(envelope);
+                r = CheckExport(envelope, *link);
             if (r != result::Success) {
                 ReplyToRemote(request, result::SessionClosed);
                 return r;
@@ -1428,7 +1588,7 @@ struct Kernel::Impl {
     static constexpr uint32_t kHasWaiters = 0x40000000;
 
     hk_thread* ThreadFromHandle(hk_thread& t, uint32_t handle) {
-        if (handle == HK_CURRENT_THREAD)
+        if (handle == static_cast<uint32_t>(HK_CURRENT_THREAD))
             return &t;
         auto object = t.process->Get<ThreadObject>(handle);
         return object ? object->thread : nullptr;
@@ -1464,7 +1624,7 @@ struct Kernel::Impl {
         std::vector<std::shared_ptr<Object>> objects;
         for (uint32_t handle : handles) {
             std::shared_ptr<Object> object =
-                handle == HK_CURRENT_THREAD ? std::shared_ptr<Object>(t.object) : t.process->Find(handle);
+                handle == static_cast<uint32_t>(HK_CURRENT_THREAD) ? std::shared_ptr<Object>(t.object) : t.process->Find(handle);
             if (!object || !IsWaitable(object.get()))
                 return result::InvalidHandle;
             objects.push_back(std::move(object));
@@ -1590,7 +1750,7 @@ struct Kernel::Impl {
     Result GetThreadId(hk_thread& t, hk_regs& r) {
         const uint32_t handle = static_cast<uint32_t>(r.x[1]);
         std::shared_ptr<ThreadObject> object =
-            handle == HK_CURRENT_THREAD ? t.object : t.process->Get<ThreadObject>(handle);
+            handle == static_cast<uint32_t>(HK_CURRENT_THREAD) ? t.object : t.process->Get<ThreadObject>(handle);
         if (!object)
             return result::InvalidHandle;
         r.x[1] = object->id;
@@ -1917,6 +2077,10 @@ void Kernel::AttachLink(std::unique_ptr<ByteStream> stream, bool initiator) {
         for (const auto& [name, port] : impl_->ports)
             if (!port.expired())
                 impl_->Send(*link, FrameWriter(Frame::PortRegistered).Text(name).Finish());
+        for (const auto& other : impl_->links)
+            if (other.get() != link)
+                for (const auto& name : other->remote_ports)
+                    impl_->Send(*link, FrameWriter(Frame::PortRegistered).Text(name).Finish());
     }
     link->writer.Start([this, link] { impl_->WriteLoop(*link); });
     link->reader.Start([this, link] { impl_->ReadLoop(*link); });

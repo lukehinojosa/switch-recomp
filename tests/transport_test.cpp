@@ -1,10 +1,13 @@
 // Cross-process IPC tests: the echo server runs in a separate host process
-// (echo_host) with its own kernel, reached over a pipe link.
+// (echo_host) with its own kernel, reached over a pipe link. Each test runs
+// twice: directly, and relayed through a third kernel between the client's
+// and the host's, as a parent host joins two sysmodule hosts.
 #include "echo_server.h"
 #include "hk/link.h"
 #include "linked_child.h"
 
 #include <chrono>
+#include <memory>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -25,6 +28,8 @@ int failures = 0;
 
 constexpr uint64_t ClientBase = 0x20000000, ClientPid = 0x7c;
 
+bool relayed = false; // the second pass
+
 struct World {
     static constexpr uint64_t ClientTls = ClientBase, ClientScratch = ClientBase + 0x200;
 
@@ -33,8 +38,19 @@ struct World {
         client_thread = kernel.CreateThread(client, ClientTls);
 
         CHECK(host.Start(testing::Beside("echo_host")));
-        if (auto stream = host.TakeStream())
+        if (relayed) {
+            hub = std::make_unique<hk::Kernel>();
+            if (auto stream = host.TakeStream())
+                hub->AttachLink(std::move(stream), true);
+            auto pair = testing::OpenStreamPair();
+            CHECK(pair.first && pair.second);
+            if (pair.first && pair.second) {
+                kernel.AttachLink(std::move(pair.first), true);
+                hub->AttachLink(std::move(pair.second), false);
+            }
+        } else if (auto stream = host.TakeStream()) {
             kernel.AttachLink(std::move(stream), true);
+        }
         session = Connect("echo");
     }
     ~World() {
@@ -97,6 +113,7 @@ struct World {
         CHECK(code == 0);
     }
 
+    std::unique_ptr<hk::Kernel> hub; // when relayed; destroyed after kernel
     hk::Kernel kernel;
     FlatMemory client_memory{ClientBase, 0x1000};
     std::shared_ptr<hk::Process> client;
@@ -141,6 +158,8 @@ void SubInterfaceMovesAcrossTheLink() {
 }
 
 void ServerSessionMovesAcrossTheLink() {
+    if (relayed)
+        return; // a server end does not pass through a relay
     World world;
     uint32_t server_end, client_end;
     CHECK(svc::CreateSession(world.client_thread, server_end, client_end) == Success);
@@ -163,6 +182,31 @@ void CopiedHandleCrossesAndStays() {
     CHECK(world.Call(world.session, request, reply) == Success);
     CHECK(world.ServerHandles() == before + 1);
     CHECK(svc::CloseHandle(world.client_thread, client_end) == Success);
+}
+
+// A session the host serves, sent back to it: copied, the client keeps its
+// own; moved, the host holds the only one, and either way it still works.
+void SessionGoesBackToItsServer() {
+    World world;
+    Message request, reply;
+    request.data = {echo::OpenSub};
+    CHECK(world.Call(world.session, request, reply) == Success && reply.move.size() == 1);
+    if (reply.move.size() != 1)
+        return;
+    const uint32_t sub = reply.move[0];
+    const uint32_t before = world.ServerHandles();
+    Message copy;
+    copy.copy = {sub};
+    copy.data = {echo::Echo};
+    CHECK(world.Call(world.session, copy, reply) == Success);
+    CHECK(world.ServerHandles() == before + 1);
+    CHECK(world.Echoes(sub, {6}));
+    Message move;
+    move.move = {sub};
+    move.data = {echo::Echo};
+    CHECK(world.Call(world.session, move, reply) == Success);
+    CHECK(world.ServerHandles() == before + 2);
+    CHECK(svc::CloseHandle(world.client_thread, sub) == InvalidHandle);
 }
 
 // The server's event, copied to the client: a mirror the server's signals
@@ -369,6 +413,7 @@ int main() {
         {"SubInterfaceMovesAcrossTheLink", SubInterfaceMovesAcrossTheLink},
         {"ServerSessionMovesAcrossTheLink", ServerSessionMovesAcrossTheLink},
         {"CopiedHandleCrossesAndStays", CopiedHandleCrossesAndStays},
+        {"SessionGoesBackToItsServer", SessionGoesBackToItsServer},
         {"EventSignalCrossesTheLink", EventSignalCrossesTheLink},
         {"EventClearCrossesBack", EventClearCrossesBack},
         {"WaitOnMirrorWakesOnSignal", WaitOnMirrorWakesOnSignal},
@@ -379,10 +424,13 @@ int main() {
         {"HostCrashClosesSessions", HostCrashClosesSessions},
         {"SessionLimitAppliesAcrossTheLink", SessionLimitAppliesAcrossTheLink},
     };
-    for (const auto& test : tests) {
-        const int before = failures;
-        test.run();
-        std::printf("%s %s\n", failures == before ? "PASS" : "FAIL", test.name);
+    for (const bool pass : {false, true}) {
+        relayed = pass;
+        for (const auto& test : tests) {
+            const int before = failures;
+            test.run();
+            std::printf("%s %s%s\n", failures == before ? "PASS" : "FAIL", test.name, relayed ? " (relayed)" : "");
+        }
     }
     std::printf("%d failure(s)\n", failures);
     return failures ? 1 : 0;

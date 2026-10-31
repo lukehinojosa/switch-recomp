@@ -14,6 +14,12 @@ namespace testing {
 // extension.
 std::filesystem::path Beside(const char* name);
 
+// Two ends of a link inside this process, for joining two kernels in it.
+struct StreamPair {
+    std::unique_ptr<hk::ByteStream> first, second;
+};
+StreamPair OpenStreamPair();
+
 class LinkedChild {
 public:
     LinkedChild() = default;

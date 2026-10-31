@@ -10,6 +10,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <vector>
 
 namespace hk {
 
@@ -115,6 +123,90 @@ void BlockingThread::Stop() {
     }
     thread_.join();
     native_ = nullptr;
+}
+
+namespace {
+
+[[noreturn]] void Throw(const char* what, int error = errno) {
+    throw std::runtime_error(std::string(what) + " (" + std::strerror(error) + ")");
+}
+
+} // namespace
+
+LinkedProcess::LinkedProcess(const std::filesystem::path& executable_path, const std::vector<std::string>& arguments) {
+    // One socket pair per direction, so that a write to a child that has
+    // gone fails instead of raising SIGPIPE. status reports a failed exec.
+    int to_child[2], from_child[2], status[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, to_child))
+        Throw("could not create a socket pair");
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, from_child)) {
+        close(to_child[0]);
+        close(to_child[1]);
+        Throw("could not create a socket pair");
+    }
+    if (pipe2(status, O_CLOEXEC)) {
+        for (int fd : {to_child[0], to_child[1], from_child[0], from_child[1]})
+            close(fd);
+        Throw("could not create a pipe");
+    }
+    // The link owns our ends from here, including on failure below.
+    stream_ = OpenPipeStream(static_cast<uintptr_t>(from_child[0]), static_cast<uintptr_t>(to_child[1]));
+
+    const std::string executable = std::filesystem::absolute(executable_path).string();
+    std::vector<std::string> command{executable, "--link", std::to_string(to_child[0]), std::to_string(from_child[1])};
+    command.insert(command.end(), arguments.begin(), arguments.end());
+    std::vector<char*> argv;
+    for (auto& argument : command)
+        argv.push_back(argument.data());
+    argv.push_back(nullptr);
+
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid == 0) {
+        // The child dies with this process, as a Windows job would see to.
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() != parent)
+            _exit(127);
+        // Its two link ends survive the exec; everything else marked
+        // close-on-exec does not.
+        fcntl(to_child[0], F_SETFD, 0);
+        fcntl(from_child[1], F_SETFD, 0);
+        execv(argv[0], argv.data());
+        const int error = errno;
+        (void)!write(status[1], &error, sizeof error);
+        _exit(127);
+    }
+    const int fork_error = errno;
+    close(to_child[0]);
+    close(from_child[1]);
+    close(status[1]);
+    if (pid < 0) {
+        close(status[0]);
+        Throw("could not start the module host", fork_error);
+    }
+    process_ = pid;
+    int error = 0;
+    const ssize_t got = read(status[0], &error, sizeof error);
+    close(status[0]);
+    if (got == sizeof error) {
+        waitpid(pid, nullptr, 0);
+        exited_ = true;
+        Throw("could not start the module host", error);
+    }
+}
+
+LinkedProcess::~LinkedProcess() {
+    if (process_ && !exited_) {
+        kill(process_, SIGKILL);
+        waitpid(process_, nullptr, 0);
+    }
+}
+
+bool LinkedProcess::Running() {
+    std::lock_guard guard(reap_);
+    if (!exited_ && waitpid(process_, nullptr, WNOHANG) == process_)
+        exited_ = true;
+    return !exited_;
 }
 
 } // namespace platform

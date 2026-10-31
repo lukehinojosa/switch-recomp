@@ -62,6 +62,7 @@ add_library(native_services
     src/services/application.cpp
     src/services/nvdrv.cpp
     src/services/vi.cpp
+    src/services/content.cpp
     src/services/probe.cpp)
 target_include_directories(native_services PUBLIC src)
 target_link_libraries(native_services PUBLIC hkernel)

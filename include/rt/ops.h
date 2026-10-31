@@ -1148,6 +1148,11 @@ void Svc(Cpu& c, u32 imm, u64 pc);
 u64 CounterTicks();
 [[noreturn]] void Unimplemented(Cpu& c, u64 pc, u32 word);
 [[noreturn]] void BadJump(Cpu& c, u64 pc, u64 target);
+// sp has just been loaded from memory (mov sp, xN after ldr xN): a switch
+// from the context whose stack was at previous to the one now in c.sp. The
+// runtime resumes the host fiber saved for c.sp, or, for a context not seen
+// before, starts one at resume, the instruction after the switch.
+void SwitchStack(Cpu& c, u64 previous, u64 resume);
 
 } // namespace rt
 

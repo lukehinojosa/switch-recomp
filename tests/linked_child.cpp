@@ -31,6 +31,19 @@ std::filesystem::path Beside(const char* name) {
     return std::filesystem::path(std::wstring(path, size)).parent_path() / (std::string(name) + ".exe");
 }
 
+StreamPair OpenStreamPair() {
+    HANDLE a_read, b_write, b_read, a_write;
+    if (!CreatePipe(&a_read, &b_write, nullptr, 0))
+        return {};
+    if (!CreatePipe(&b_read, &a_write, nullptr, 0)) {
+        CloseHandle(a_read);
+        CloseHandle(b_write);
+        return {};
+    }
+    return {hk::OpenPipeStream(reinterpret_cast<uintptr_t>(a_read), reinterpret_cast<uintptr_t>(a_write)),
+            hk::OpenPipeStream(reinterpret_cast<uintptr_t>(b_read), reinterpret_cast<uintptr_t>(b_write))};
+}
+
 bool LinkedChild::Start(const std::filesystem::path& program) {
     // to_child: we write, the child reads. from_child: the child writes.
     SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
@@ -89,6 +102,19 @@ LinkedChild::~LinkedChild() {
 
 std::filesystem::path Beside(const char* name) {
     return std::filesystem::read_symlink("/proc/self/exe").parent_path() / name;
+}
+
+StreamPair OpenStreamPair() {
+    int a_to_b[2], b_to_a[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, a_to_b))
+        return {};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, b_to_a)) {
+        close(a_to_b[0]);
+        close(a_to_b[1]);
+        return {};
+    }
+    return {hk::OpenPipeStream(static_cast<uintptr_t>(b_to_a[0]), static_cast<uintptr_t>(a_to_b[1])),
+            hk::OpenPipeStream(static_cast<uintptr_t>(a_to_b[0]), static_cast<uintptr_t>(b_to_a[1]))};
 }
 
 bool LinkedChild::Start(const std::filesystem::path& program) {

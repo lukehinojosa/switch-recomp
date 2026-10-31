@@ -121,9 +121,27 @@ controllers, `nvdrv` with no GPU behind it, which records what the title
 submits, and `vi` as a display that shows nothing.
 [docs/title-host.md](docs/title-host.md) lists what MK8D calls.
 
-Set `RT_TRACE=1` to log supervisor calls; lift with `--track-pc` to get the
-guest PC and a backtrace on faults. `RT_BOOT_MODE` sets the boot mode the
-`pm:bm` stub reports (default 1, maintenance), and `RT_PROBE=1` checks that
+Recompiled sysmodules run beside it, each in a `module_host` of its own
+built with its lift: `--sysmodule <host> <module.load.elf>`, repeated, starts
+each as a linked child. The parent's kernel relays between its links, so the
+children reach each other's services as well as the parent's. The services a
+module's `main.npdm` hosts replace the stubs of the same names everywhere, and
+the parent serves `pm:info`, `pgl`, `ncm` and `lr` for every process;
+`--content <folder>` (from `nca.py --content-index <folder> [package...]`)
+gives `ncm` and `lr` the firmware's content metas and those of the user's
+packages. `--system-data <folder>` (from
+`nca.py --system-data <folder> all`) and `--calibration <file>` (from
+`tools/calibration.py <file>`, a blank CAL0 image) give `fsp-srv` the
+firmware's system data archives and the console's calibration partition;
+both pass on to the children. Each child's output is prefixed with its
+module's name. [docs/system-processes.md](docs/system-processes.md) records
+running `settings`, `account` and `ns` this way.
+
+Set `RT_TRACE=1` to log supervisor calls, and the commands a recompiled
+server receives and the results it replies with; lift with `--track-pc` to
+get the guest PC and a backtrace on faults, and set `RT_PEEK=<address>,...`
+to print those guest words with them. `RT_BOOT_MODE` sets the boot mode the
+`pm:bm` stub reports (default 0, a normal boot; 1 is maintenance), and `RT_PROBE=1` checks that
 the module serves `pctl`, then exits.
 
 `nca.py --extract <folder>` writes the matching modules' ExeFS files (`main`,
@@ -134,13 +152,20 @@ NCA, and `--exefs <game.nsp> <folder>` its program's ExeFS, decrypted with the
 title key from the NSP's own ticket. `--romfs <game.xci|nsp> <out> [--update
 <update.nsp>]` writes the game's RomFS image, with the update's patch (BKTR)
 section applied over it when given, and `--firmware <folder> --system-data
-<folder> <id>...` writes system-data archives (fonts, Mii data) as RomFS images.
+<folder> <id>...` writes system-data archives (fonts, Mii data) as RomFS
+images, or every one of them for `all`. `--content-index <folder>
+[package...]` writes the firmware's content metas, and those of NSPs and
+XCIs as installed, in the form `ncm` keeps them, for `module_host
+--content`.
 Both check every block against the section's IVFC hashes as they write.
 
 `module_host --link <read> <write>` serves over a link to a parent process,
 which reaches the ports the module registers; `--application <pid> <program
 id> <version> <control.nacp>` makes `arp:r` report that process as a running
-application. The `module_client` library (`src/client/`) is the parent's side:
+application. With `--title`, `--launch` starts the title only when the
+recompiled `ns` launches it: the host asks `ns` as `am` does (see
+[docs/system-processes.md](docs/system-processes.md)), which does not get
+through yet. The `module_client` library (`src/client/`) is the parent's side:
 it starts the host, connects to its ports and sends CMIF requests. With a
 lifted `pctl`, `pctl_shadow` uses it to make the requests Mario Kart 8 Deluxe
 makes and compare the replies with mk8-recomp's verified service:

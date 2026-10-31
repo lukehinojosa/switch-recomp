@@ -247,7 +247,7 @@ call, and report anything else:
 | Service | Commands answered | Answer |
 | :--- | :--- | :--- |
 | `lm` | `OpenLogger`; `ILogger` `Log`, `SetDestination` | accepted and dropped |
-| `pm:bm` | `GetBootMode`, `SetMaintenanceBoot` | boot mode from `RT_BOOT_MODE`, default 1 (maintenance) |
+| `pm:bm` | `GetBootMode`, `SetMaintenanceBoot` | boot mode from `RT_BOOT_MODE`, default 1 (maintenance); 0 (normal) since phase 2 |
 | `fsp-srv` | `SetCurrentProcess`; system save create, open, read extra data, extend; `IFileSystem` create, delete, open, entry type, commit, space; `IFile` read, write, flush, size | an in-memory save store that starts empty, as on a fresh console |
 | `ovln:snd` | `OpenSender`; `ISender` `Send` | accepted and dropped |
 | `arp:r` | launch and control property queries (by PID or program ID), command 6 | the process given by `--application` is a running application with that program ID, version and `control.nacp`, on the SD card, instance ID 1; any other caller is "not registered". Command 6 is read as `GetApplicationInstanceId(pid)` (libnx's numbering; pctl sends a PID): an assumption |

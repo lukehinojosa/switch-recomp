@@ -134,6 +134,35 @@ void SubInterfaceIsAMovedSession() {
     CHECK(client.Call(session, 4, 9, {}).result != 0); // unknown command
 }
 
+// The same interfaces over TIPC: the command in the message type, a reply
+// of the same type starting with the result, and a sub-interface as a moved
+// session that speaks TIPC too.
+void TipcRequestsAreServed() {
+    hk::Kernel& kernel = *new hk::Kernel; // outlives the test: services keep serving
+    services::NativeHost host(kernel, false);
+    host.Add("test", 4, [] { return std::make_shared<Root>(); });
+    host.Start();
+    Client client(kernel);
+    const uint32_t session = client.Connect("test");
+    CHECK(session != 0);
+    auto call = [&](uint32_t handle, uint32_t command, std::vector<uint32_t> data) {
+        Message request;
+        request.type = 16 + command;
+        request.data = std::move(data);
+        WriteMessage(client.memory, Tls, request);
+        CHECK(svc::SendSyncRequest(client.thread, handle) == Success);
+        return ReadMessage(client.memory, Tls);
+    };
+    const Message opened = call(session, 1, {});
+    CHECK(opened.type == 17 && opened.data.size() == 1 && opened.data[0] == 0 && opened.move.size() == 1);
+    if (opened.move.size() != 1)
+        return;
+    const Message answered = call(opened.move[0], 2, {41});
+    CHECK(answered.type == 18 && answered.data == (std::vector<uint32_t>{0, 42}));
+    const Message unknown = call(session, 9, {});
+    CHECK(unknown.type == 25 && unknown.data.size() == 1 && unknown.data[0] != 0);
+}
+
 void CloneGivesASecondSession() {
     hk::Kernel& kernel = *new hk::Kernel; // outlives the test: services keep serving
     services::NativeHost host(kernel, false);
@@ -286,6 +315,7 @@ int main() {
         {"DomainCarriesObjectsById", DomainCarriesObjectsById},
         {"DomainCloneKeepsItsObjects", DomainCloneKeepsItsObjects},
         {"SharedMemoryArrivesAsASnapshot", SharedMemoryArrivesAsASnapshot},
+        {"TipcRequestsAreServed", TipcRequestsAreServed},
         {"SmDefersUntilRegistered", SmDefersUntilRegistered},
     };
     for (const auto& test : tests) {

@@ -380,6 +380,102 @@ def npdm_services(npdm):
     return name, hosted, used
 
 
+# ncm's storage ids, as content meta headers and lr name them.
+STORAGE_BUILT_IN_SYSTEM, STORAGE_BUILT_IN_USER = 3, 4
+STORAGE_NAMES = {STORAGE_BUILT_IN_SYSTEM: "BuiltInSystem", STORAGE_BUILT_IN_USER: "BuiltInUser"}
+
+
+def content_info(content_id, size, content_type, id_offset=0):
+    """An ncm ContentInfo: content id, 40-bit size, attributes, type, id offset."""
+    return content_id + size.to_bytes(5, "little") + bytes([0, content_type, id_offset])
+
+
+def installed_content_meta(cnmt, meta_id, meta_size, storage):
+    """Convert a packaged content meta (the .cnmt in a Meta NCA) to the value
+    ncm keeps in its database, and its ContentMetaKey.
+
+    Packaged: id, version, type, platform, extended header size, content
+    count, content meta count, attributes (0x20 bytes), the extended header,
+    PackagedContentInfo[] (a SHA-256 then a ContentInfo), ContentMetaInfo[].
+    Installed: extended header size, content count, content meta count,
+    attributes, storage id (8 bytes), the extended header, ContentInfo[] with
+    the Meta NCA itself first (as ncm's installer writes it), ContentMetaInfo[].
+    """
+    meta_id_, version, meta_type, _, ext_size, count, meta_count, attributes = \
+        struct.unpack_from("<QIBBHHHB", cnmt, 0)
+    extended = cnmt[0x20:0x20 + ext_size]
+    infos = [content_info(meta_id, meta_size, 0)]
+    at = 0x20 + ext_size
+    for i in range(count):
+        infos.append(cnmt[at + 0x20:at + 0x38])
+        at += 0x38
+    metas = cnmt[at:at + meta_count * 0x10]
+    header = struct.pack("<HHHBB", ext_size, count + 1, meta_count, attributes, storage)
+    key = struct.pack("<QIBBxx", meta_id_, version, meta_type, 0) # install type: full
+    return key, header + extended + b"".join(infos) + metas
+
+
+def write_content_meta(out, storage, nca, content_id, size, location):
+    """Write one Meta NCA's content meta under out/<storage>/ and return its key."""
+    files = nca.pfs0(0)
+    name = next(n for n in files if n.endswith(".cnmt"))
+    key, value = installed_content_meta(nca.read_file(0, name), content_id, size, storage)
+    meta_id, version, meta_type, install = struct.unpack_from("<QIBB", key, 0)
+    folder = Path(out) / STORAGE_NAMES[storage]
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{meta_id:016x}_{version}_{meta_type}_{install}.meta").write_bytes(value)
+    return meta_id, version, meta_type
+
+
+def write_content_index(out, firmware, packages, keys):
+    """The firmware's content metas as BuiltInSystem's, and those of the
+    packages (NSP or XCI) as installed in BuiltInUser, with contents.txt in
+    each storage: where every content's NCA is (content id, offset, size, its
+    rights ID and key generation as ncm reports them, file)."""
+    locations = {STORAGE_BUILT_IN_SYSTEM: [], STORAGE_BUILT_IN_USER: []}
+    count = 0
+    if firmware:
+        for path in sorted(Path(firmware).glob("*.nca")):
+            content_id = bytes.fromhex(path.name[:32])
+            size = path.stat().st_size
+            locations[STORAGE_BUILT_IN_SYSTEM].append((content_id, path, 0, size, Nca(path, keys)))
+            if path.name.endswith(".cnmt.nca"):
+                write_content_meta(out, STORAGE_BUILT_IN_SYSTEM, Nca(path, keys), content_id, size, path)
+                count += 1
+    for package in packages:
+        for name, (offset, size) in container_entries(package).items():
+            if not name.endswith(".nca"):
+                continue
+            content_id = bytes.fromhex(name[:32])
+            locations[STORAGE_BUILT_IN_USER].append((content_id, Path(package), offset, size, Nca(package, keys, offset)))
+            if name.endswith(".cnmt.nca"):
+                meta_id, version, meta_type = write_content_meta(
+                    out, STORAGE_BUILT_IN_USER, Nca(package, keys, offset), content_id, size, package)
+                print(f"{Path(package).name}: {meta_id:016x} v{version} type {meta_type:#x}")
+                count += 1
+    # An install replaces an older version of the same content meta, as an
+    # update replaces the patch a game card carries.
+    for folder in Path(out).iterdir():
+        newest = {}
+        for meta in folder.glob("*.meta"):
+            meta_id, version, meta_type, install = meta.stem.split("_")
+            newest.setdefault((meta_id, meta_type, install), []).append((int(version), meta))
+        for versions in newest.values():
+            for _, meta in sorted(versions)[:-1]:
+                meta.unlink()
+                count -= 1
+    for storage, entries in locations.items():
+        if not entries:
+            continue
+        folder = Path(out) / STORAGE_NAMES[storage]
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / "contents.txt", "w", encoding="utf-8") as f:
+            for content_id, path, offset, size, nca in entries:
+                generation = max(nca.header[0x206], nca.header[0x220])
+                f.write(f"{content_id.hex()} {offset:#x} {size:#x} {nca.rights_id.hex()} {generation} {path.resolve()}\n")
+    print(f"{count} content metas written under {out}")
+
+
 def scan(firmware, keys):
     for path in sorted(Path(firmware).glob("*.nca")):
         if path.name.endswith(".cnmt.nca"):
@@ -411,21 +507,28 @@ def main():
     parser.add_argument("--update", metavar="NSP",
                         help="with --romfs, apply this update's patch RomFS over the game's")
     parser.add_argument("--system-data", nargs="+", metavar=("OUT", "ID"),
-                        help="write the RomFS image of each firmware system-data archive ID (hex) "
-                             "to OUT/<id>.romfs")
+                        help="write the RomFS image of each firmware system-data archive ID (hex), "
+                             "or of every one for 'all', to OUT/<id>.romfs")
+    parser.add_argument("--content-index", nargs="+", metavar=("OUT", "PACKAGE"),
+                        help="write the firmware's content metas (with --firmware) and each package's "
+                             "(NSP or XCI, as installed in BuiltInUser) under OUT, for module_host --content")
     args = parser.parse_args()
     keys = load_keys(args.keys)
+    if args.content_index:
+        write_content_index(args.content_index[0], args.firmware, args.content_index[1:], keys)
+        return
     if args.system_data:
         if not args.firmware or len(args.system_data) < 2:
             parser.error("--system-data needs --firmware, a folder and at least one ID")
         out = Path(args.system_data[0])
         out.mkdir(parents=True, exist_ok=True)
-        wanted = {int(i, 16) for i in args.system_data[1:]}
+        every = args.system_data[1:] == ["all"]
+        wanted = set() if every else {int(i, 16) for i in args.system_data[1:]}
         for path in sorted(Path(args.firmware).glob("*.nca")):
-            if path.name.endswith(".cnmt.nca") or not wanted:
+            if path.name.endswith(".cnmt.nca") or not (wanted or every):
                 continue
             nca = Nca(path, keys)
-            if nca.content_type not in (4, 5) or nca.program_id not in wanted: # Data or PublicData
+            if nca.content_type not in (4, 5) or not (every or nca.program_id in wanted): # Data or PublicData
                 continue
             index = nca.romfs_section()
             target = out / f"{nca.program_id:016x}.romfs"

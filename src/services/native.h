@@ -94,6 +94,11 @@ public:
 
     // Publishes a port; call before Start. Adding a name again replaces it.
     void Add(std::string name, uint32_t max_sessions, Factory factory);
+    // Leaves out the ports with these names, which recompiled sysmodules
+    // host instead; call before Start.
+    void Omit(const std::vector<std::string>& names);
+    // The ports added so far.
+    std::vector<std::string> Names() const;
     void Start();
 
     struct State;
